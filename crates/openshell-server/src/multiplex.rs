@@ -185,7 +185,10 @@ impl MultiplexService {
         let service = MultiplexedService::new(grpc_service, http_service);
 
         let mut builder = Builder::new(TokioExecutor::new());
-        builder.http2().adaptive_window(true);
+        builder
+            .http2()
+            .adaptive_window(true)
+            .enable_connect_protocol();
 
         builder
             .serve_connection_with_upgrades(TokioIo::new(stream), service)

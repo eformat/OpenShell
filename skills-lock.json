@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "hummingbird": {
+      "source": "redhat/hummingbird/skills",
+      "sourceType": "gitlab",
+      "skillPath": "SKILL.md",
+      "computedHash": "0514825fdc2c08b6a063266d1dc17a6185c7132a4923adb498d0ad5bae130026"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+# Patched gateway image with HTTP/2 WebSocket (RFC 8441) support.
+# Adds libz3 + libgmp from Fedora since the binary links against them.
+
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e1fd250ce83d94603e9887ec991156a6c26905a6b0001039b7a43699018c0733
+
+FROM registry.fedoraproject.org/fedora:43 AS libs
+RUN dnf install -y z3-libs gmp && dnf clean all
+RUN mkdir /staging && \
+    cp -L /usr/lib64/libz3.so.4.15 /staging/libz3.so.4.15 && \
+    cp -L /usr/lib64/libgmp.so.10 /staging/libgmp.so.10
+
+FROM ${GATEWAY_BASE_IMAGE} AS gateway
+
+ARG TARGETARCH
+
+WORKDIR /app
+
+COPY --from=libs /staging/libz3.so.4.15 /usr/lib/x86_64-linux-gnu/libz3.so.4.15
+COPY --from=libs /staging/libgmp.so.10 /usr/lib/x86_64-linux-gnu/libgmp.so.10
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+
+USER 1000:1000
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

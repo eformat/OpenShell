@@ -301,6 +301,7 @@ async fn proxy_to_endpoint(
         return Err(err);
     }
 
+    let h2_websocket = is_h2_websocket_connect(&req);
     let websocket_upgrade = is_websocket_upgrade(&req);
     let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
 
@@ -366,7 +367,7 @@ async fn proxy_to_endpoint(
         });
     }
 
-    let upstream = build_upstream_request(req, target_port, websocket_upgrade)?;
+    let upstream = build_upstream_request(req, target_port, websocket_upgrade, h2_websocket)?;
     let mut response = sender.send_request(upstream).await.map_err(|err| {
         warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
         let route_err = ServiceRouteError::service_unreachable();
@@ -399,6 +400,12 @@ async fn proxy_to_endpoint(
             }
         });
 
+        if h2_websocket {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap());
+        }
         let (parts, _) = response.into_parts();
         return Ok(Response::from_parts(parts, Body::empty()));
     }
@@ -427,6 +434,7 @@ fn build_upstream_request(
     req: Request<Body>,
     target_port: u16,
     preserve_upgrade_headers: bool,
+    h2_websocket: bool,
 ) -> Result<Request<Body>, ServiceRouteError> {
     let (parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
@@ -434,8 +442,14 @@ fn build_upstream_request(
         .parse::<http::Uri>()
         .map_err(|_| ServiceRouteError::invalid_request())?;
 
+    let method = if h2_websocket {
+        Method::GET
+    } else {
+        parts.method
+    };
+
     let mut builder = Request::builder()
-        .method(parts.method)
+        .method(method)
         .uri(uri)
         .version(http::Version::HTTP_11);
 
@@ -461,6 +475,21 @@ fn build_upstream_request(
         header::HOST,
         format!("127.0.0.1:{target_port}").parse().unwrap(),
     );
+    headers.remove("origin");
+
+    if h2_websocket {
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        if !headers.contains_key("sec-websocket-version") {
+            headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
+        }
+        if !headers.contains_key("sec-websocket-key") {
+            headers.insert(
+                "sec-websocket-key",
+                HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+            );
+        }
+    }
 
     builder
         .body(body)
@@ -483,9 +512,21 @@ pub fn request_host<B>(req: &Request<B>) -> Option<&str> {
 }
 
 fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
+    is_h1_websocket_upgrade(req) || is_h2_websocket_connect(req)
+}
+
+fn is_h1_websocket_upgrade<B>(req: &Request<B>) -> bool {
     req.method() == Method::GET
         && header_value_is(req.headers(), header::UPGRADE, "websocket")
         && header_contains_token(req.headers(), header::CONNECTION, "upgrade")
+}
+
+fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
+    req.method() == Method::CONNECT
+        && req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"))
 }
 
 fn header_value_is(headers: &HeaderMap, name: header::HeaderName, expected: &str) -> bool {
@@ -1055,7 +1096,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let upstream = build_upstream_request(request, 8080, false).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, false).unwrap();
 
         assert_eq!(upstream.uri(), "/path");
         assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
@@ -1092,7 +1133,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let upstream = build_upstream_request(request, 8080, true).unwrap();
+        let upstream = build_upstream_request(request, 8080, true, false).unwrap();
 
         assert_eq!(upstream.uri(), "/chat?session=main");
         assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
