@@ -44,9 +44,11 @@ disable telemetry in a default (telemetry-enabled) build.
 OpenShell uses different Linux libc environments for different host artifacts.
 The standalone `openshell` CLI is built as a static musl binary so it can run on
 a wide range of Linux distributions without depending on the host's glibc. Host
-runtime binaries that use the GNU/Linux runtime environment, including
-`openshell-gateway` and `openshell-driver-vm`, are GNU-linked and built with a
-glibc 2.31 floor.
+runtime binaries that use the GNU/Linux runtime environment are GNU-linked.
+`openshell-gateway` and `openshell-driver-vm` are built with a glibc 2.28 floor.
+The gateway bundles z3 into the release binary so Linux packages, standalone
+tarballs, and gateway images do not depend on distro-specific z3 shared-library
+SONAMEs.
 
 ## Container Builds
 
@@ -58,24 +60,37 @@ Dockerfile compiles Rust — both copy a staged binary out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
 Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
-binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.31, including
+binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
-packages share the same host portability floor. Supervisor binaries remain
-static musl and use `cargo zigbuild` when available, including native CPU
-architectures, so C dependencies are compiled for the musl target instead of the
-host GNU libc target. Local Docker image tasks infer the target architecture from
-`DOCKER_PLATFORM` when set, otherwise from the container engine host metadata
-with the kernel architecture as the fallback. CI invokes the same staging step
-via the `rust-native-build.yml` workflow (per-architecture, per-component) and
-uploads the result as an artifact that the image build job downloads back into
-the staging directory before running Buildx.
+packages share the same host portability floor. The gateway build enables
+`bundled-z3`. Linux VM driver release artifacts use the same glibc floor so
+package-managed VM support does not raise the package runtime requirement.
+Gateway staging and release workflows set up the Zig C/C++ wrapper before
+bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
+before publishing or copying artifacts.
+Supervisor binaries remain static musl and use `cargo zigbuild` when available,
+including native CPU architectures, so C dependencies are compiled for the musl
+target instead of the host GNU libc target. Local Docker image tasks infer the
+target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
+valid container engine host metadata and fail when the engine query is
+unavailable or reports an unsupported architecture, avoiding host-kernel
+fallbacks that can target the wrong architecture. CI invokes the same staging
+step via the `rust-native-build.yml` workflow (per-architecture, per-component)
+and uploads the result as an artifact that the image build job downloads back
+into the staging directory before running Buildx.
 
 Runtime layout:
 
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
   `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`. Linux GNU
-  gateway and VM driver binaries must not reference `GLIBC_*` symbols newer than
-  `GLIBC_2.31`; release workflows verify this before publishing artifacts.
+  gateway binaries must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.28`; release workflows verify this before publishing artifacts. The
+  gateway bundles z3, so the image does not need a distro-provided z3 runtime.
+- **VM driver**: host GNU-linked binary installed at
+  `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
+  as a release artifact. Linux GNU VM driver binaries must not reference
+  `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
+  before publishing artifacts.
 - **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
   Static linkage is required because the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes
@@ -93,6 +108,23 @@ the macOS user's shared home directory.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.
+
+Container-engine selection is centralized in `tasks/scripts/container-engine.sh`.
+`CONTAINER_ENGINE=docker|podman` is the only explicit override. Docker- and
+Podman-backed e2e wrappers validate that override against their lane, set
+`OPENSHELL_E2E_DRIVER`, and reject the removed
+`OPENSHELL_E2E_CONTAINER_ENGINE` selector so build helpers and Rust e2e support
+containers use the same engine. When no explicit override is present, an e2e
+driver requirement wins, then a local-cluster requirement, then host
+auto-detection.
+
+Local Kubernetes image workflows opt into cluster-aware selection with
+`CONTAINER_ENGINE_TARGET=local-k8s-cluster`. The hint is intentionally scoped to
+Skaffold-style `push: false` builds where the image must land in the engine
+backing the active local cluster: `k3d-*` contexts require Docker, `kind-*`
+contexts use `KIND_EXPERIMENTAL_PROVIDER=docker|podman` when set, and ambiguous
+or unknown contexts require an explicit `CONTAINER_ENGINE`. Other image builds
+do not infer from kube context.
 
 ## CI and E2E
 

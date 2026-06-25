@@ -42,17 +42,18 @@ use openshell_core::proto::{
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, HealthRequest,
-    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
-    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
-    ListSandboxesRequest, ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
+    HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PlatformEvent,
+    PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
     SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -123,7 +124,7 @@ fn ready_false_condition_message(
 
 fn provisioning_timeout_message(
     timeout_secs: u64,
-    requested_gpu: bool,
+    resource_requirements: Option<&ResourceRequirements>,
     condition_message: Option<&str>,
 ) -> String {
     let mut message = format!("sandbox provisioning timed out after {timeout_secs}s");
@@ -133,7 +134,7 @@ fn provisioning_timeout_message(
         message.push_str(condition_message);
     }
 
-    if requested_gpu {
+    if resource_requirements.is_some_and(|requirements| requirements.gpu.is_some()) {
         message.push_str(
             ". Hint: this may be because the available GPU is already in use by another sandbox.",
         );
@@ -1753,7 +1754,7 @@ pub async fn sandbox_create(
     gateway_name: &str,
     uploads: &[(String, Option<String>, bool)],
     keep: bool,
-    gpu: bool,
+    gpu_requirements: Option<GpuResourceRequirements>,
     cpu: Option<&str>,
     memory: Option<&str>,
     driver_config_json: Option<&str>,
@@ -1809,8 +1810,6 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let requested_gpu = gpu;
-
     let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
     let inferred_types: Vec<String> = if providers_v2_enabled {
         Vec::new()
@@ -1842,9 +1841,11 @@ pub async fn sandbox_create(
         None
     };
 
+    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
+
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            gpu: requested_gpu,
+            resource_requirements,
             environment: environment.clone(),
             policy,
             providers: configured_providers,
@@ -1989,7 +1990,7 @@ pub async fn sandbox_create(
         if remaining.is_zero() {
             let timeout_message = provisioning_timeout_message(
                 provision_timeout.as_secs(),
-                requested_gpu,
+                resource_requirements.as_ref(),
                 last_condition_message.as_deref(),
             );
             if let Some(d) = display.as_mut() {
@@ -2008,7 +2009,7 @@ pub async fn sandbox_create(
                 // Timeout fired — the stream was idle for too long.
                 let timeout_message = provisioning_timeout_message(
                     provision_timeout.as_secs(),
-                    requested_gpu,
+                    resource_requirements.as_ref(),
                     last_condition_message.as_deref(),
                 );
                 if let Some(d) = display.as_mut() {
@@ -4347,7 +4348,7 @@ fn read_gcloud_adc() -> Result<(String, String, String)> {
     Ok((client_id, client_secret, refresh_token))
 }
 
-async fn rollback_provider_create_after_vertex_adc_failure(
+async fn rollback_provider_create_after_gcloud_adc_failure(
     client: &mut crate::tls::GrpcClient,
     provider_name: &str,
     stage: &str,
@@ -4360,7 +4361,7 @@ async fn rollback_provider_create_after_vertex_adc_failure(
         .await
     {
         Ok(_) => Err(miette!(
-            "failed to {stage} Vertex AI credentials from gcloud ADC for provider '{provider_name}': {source}. \
+            "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
              The provider was rolled back successfully."
         )),
         Err(cleanup_err) => {
@@ -4374,7 +4375,7 @@ async fn rollback_provider_create_after_vertex_adc_failure(
                 provider_name
             );
             Err(miette!(
-                "failed to {stage} Vertex AI credentials from gcloud ADC for provider '{provider_name}': {source}. \
+                "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
                  Cleanup also failed, so the provider may still exist. \
                  Run 'openshell provider delete {provider_name}' to remove it manually."
             ))
@@ -4483,12 +4484,23 @@ async fn discover_existing_provider_data(
 /// Canonical provider type string for Google Vertex AI.
 const VERTEX_AI_PROVIDER_TYPE: &str = "google-vertex-ai";
 
+/// Canonical provider type string for Google Cloud (GCP APIs).
+const GOOGLE_CLOUD_PROVIDER_TYPE: &str = "google-cloud";
+
 fn missing_credentials_error(provider_type: &str) -> miette::Report {
     if provider_type == VERTEX_AI_PROVIDER_TYPE {
         return miette::miette!(
             "no credentials resolved for provider type '{provider_type}'. \
              Set GOOGLE_VERTEX_AI_TOKEN, VERTEX_AI_TOKEN, \
              GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN, or VERTEX_AI_SERVICE_ACCOUNT_TOKEN; \
+             or use --from-gcloud-adc / --from-existing with those env vars set."
+        );
+    }
+
+    if provider_type == GOOGLE_CLOUD_PROVIDER_TYPE {
+        return miette::miette!(
+            "no credentials resolved for provider type '{provider_type}'. \
+             Set GCP_ADC_ACCESS_TOKEN or GCP_SA_ACCESS_TOKEN; \
              or use --from-gcloud-adc / --from-existing with those env vars set."
         );
     }
@@ -4583,11 +4595,34 @@ pub async fn provider_create_with_options(
         }
     };
 
-    if from_gcloud_adc && provider_type != VERTEX_AI_PROVIDER_TYPE {
-        return Err(miette::miette!(
-            "--from-gcloud-adc is only valid for google-vertex-ai providers"
-        ));
-    }
+    let adc_credential_key = if from_gcloud_adc {
+        let profile =
+            openshell_providers::get_default_profile(&provider_type).ok_or_else(|| {
+                miette::miette!(
+                    "--from-gcloud-adc requires a built-in provider profile, \
+                 but '{provider_type}' has none"
+                )
+            })?;
+        let adc_cred = profile.adc_credential().ok_or_else(|| {
+            miette::miette!(
+                "--from-gcloud-adc is not supported for '{provider_type}' providers \
+                 (no ADC-compatible credential in the provider profile)"
+            )
+        })?;
+        Some(
+            adc_cred
+                .env_vars
+                .first()
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "ADC credential in '{provider_type}' profile has no env_vars declared"
+                    )
+                })?
+                .clone(),
+        )
+    } else {
+        None
+    };
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
@@ -4636,10 +4671,12 @@ pub async fn provider_create_with_options(
     }
 
     // Validate and read the ADC file BEFORE creating the provider so that
-    // a bad/missing ADC does not leave an orphan provider behind.
-    let gcloud_adc_material = if from_gcloud_adc {
+    // a bad/missing ADC does not leave an orphan provider behind. Bundle the
+    // credential key with the material so they stay coupled.
+    let gcloud_adc_bootstrap = if from_gcloud_adc {
         let (client_id, client_secret, refresh_token) = read_gcloud_adc()?;
-        Some((client_id, client_secret, refresh_token))
+        let key = adc_credential_key.expect("set when from_gcloud_adc is true");
+        Some((key, client_id, client_secret, refresh_token))
     } else {
         None
     };
@@ -4669,7 +4706,9 @@ pub async fn provider_create_with_options(
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
     let provider_name = provider.object_name().to_string();
 
-    if let Some((client_id, client_secret, refresh_token)) = gcloud_adc_material {
+    if let Some((adc_credential_key, client_id, client_secret, refresh_token)) =
+        gcloud_adc_bootstrap
+    {
         let mut material = HashMap::new();
         material.insert("client_id".to_string(), client_id);
         material.insert("client_secret".to_string(), client_secret);
@@ -4678,7 +4717,7 @@ pub async fn provider_create_with_options(
         if let Err(configure_err) = client
             .configure_provider_refresh(ConfigureProviderRefreshRequest {
                 provider: provider_name.clone(),
-                credential_key: openshell_core::inference::VERTEX_AI_ADC_TOKEN_KEY.to_string(),
+                credential_key: adc_credential_key.clone(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
                 material,
                 secret_material_keys: vec![
@@ -4689,7 +4728,7 @@ pub async fn provider_create_with_options(
             })
             .await
         {
-            return rollback_provider_create_after_vertex_adc_failure(
+            return rollback_provider_create_after_gcloud_adc_failure(
                 &mut client,
                 &provider_name,
                 "configure",
@@ -4701,11 +4740,11 @@ pub async fn provider_create_with_options(
         if let Err(rotate_err) = client
             .rotate_provider_credential(RotateProviderCredentialRequest {
                 provider: provider_name.clone(),
-                credential_key: openshell_core::inference::VERTEX_AI_ADC_TOKEN_KEY.to_string(),
+                credential_key: adc_credential_key,
             })
             .await
         {
-            return rollback_provider_create_after_vertex_adc_failure(
+            return rollback_provider_create_after_gcloud_adc_failure(
                 &mut client,
                 &provider_name,
                 "mint the initial access token for",
@@ -4715,9 +4754,7 @@ pub async fn provider_create_with_options(
         }
 
         println!("{} Created provider {}", "✓".green().bold(), provider_name);
-        println!(
-            "Configured Vertex AI credentials from gcloud ADC and minted the initial access token"
-        );
+        println!("Configured GCP credentials from gcloud ADC and minted the initial access token");
         return Ok(());
     }
 
@@ -4778,11 +4815,66 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
     Ok(())
 }
 
+fn provider_to_json(provider: &Provider) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+
+    // Core fields
+    obj.insert("id".to_string(), serde_json::json!(provider.object_id()));
+    obj.insert(
+        "name".to_string(),
+        serde_json::json!(provider.object_name()),
+    );
+    obj.insert("type".to_string(), serde_json::json!(provider.r#type));
+
+    // Credential keys (NEVER values - security)
+    let credential_keys: Vec<String> = provider.credentials.keys().cloned().collect();
+    obj.insert(
+        "credential_keys".to_string(),
+        serde_json::json!(credential_keys),
+    );
+
+    // Config keys (keys only, not values)
+    if !provider.config.is_empty() {
+        let config_keys: Vec<String> = provider.config.keys().cloned().collect();
+        obj.insert("config_keys".to_string(), serde_json::json!(config_keys));
+    }
+
+    // Metadata fields (only if metadata exists)
+    if let Some(meta) = &provider.metadata {
+        if !meta.labels.is_empty() {
+            obj.insert("labels".to_string(), serde_json::json!(meta.labels));
+        }
+        if meta.resource_version != 0 {
+            obj.insert(
+                "resource_version".to_string(),
+                serde_json::json!(meta.resource_version),
+            );
+        }
+        if meta.created_at_ms != 0 {
+            obj.insert(
+                "created_at".to_string(),
+                serde_json::json!(format_epoch_ms(meta.created_at_ms)),
+            );
+        }
+    }
+
+    // Credential expiration times (only if present)
+    if !provider.credential_expires_at_ms.is_empty() {
+        obj.insert(
+            "credential_expires_at_ms".to_string(),
+            serde_json::json!(provider.credential_expires_at_ms),
+        );
+    }
+
+    serde_json::Value::Object(obj)
+}
+
 pub async fn provider_list(
     server: &str,
     limit: u32,
     offset: u32,
     names_only: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -4791,6 +4883,11 @@ pub async fn provider_list(
         .await
         .into_diagnostic()?;
     let providers = response.into_inner().providers;
+
+    // Handle structured output formats (json, yaml)
+    if crate::output::print_output_collection(output, &providers, provider_to_json)? {
+        return Ok(());
+    }
 
     if providers.is_empty() {
         if !names_only {
@@ -4895,6 +4992,21 @@ pub async fn provider_profile_export(
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let rendered = provider_profile_export_text(server, id, output, tls).await?;
+    if output == "json" {
+        println!("{rendered}");
+    } else {
+        print!("{rendered}");
+    }
+    Ok(())
+}
+
+pub async fn provider_profile_export_text(
+    server: &str,
+    id: &str,
+    output: &str,
+    tls: &TlsOptions,
+) -> Result<String> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_provider_profile(GetProviderProfileRequest { id: id.to_string() })
@@ -4906,16 +5018,14 @@ pub async fn provider_profile_export(
         .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
     let profile = ProviderTypeProfile::from_proto(&profile);
 
-    if !crate::output::print_output_direct(
-        output,
-        || profile_to_json(&profile).into_diagnostic(),
-        || profile_to_yaml(&profile).into_diagnostic(),
-    )? {
-        return Err(miette!(
+    match output {
+        "json" => profile_to_json(&profile).into_diagnostic(),
+        "yaml" => profile_to_yaml(&profile).into_diagnostic(),
+        "table" => Err(miette!(
             "profile export supports '-o yaml' and '-o json'; table output is not supported"
-        ));
+        )),
+        _ => Err(miette!("unsupported output format: {output}")),
     }
-    Ok(())
 }
 
 pub async fn provider_profile_import(
@@ -4957,6 +5067,47 @@ pub async fn provider_profile_import(
 
     print_profile_diagnostics(&diagnostics);
     Err(miette!("provider profile import failed"))
+}
+
+pub async fn provider_profile_update(
+    server: &str,
+    id: &str,
+    file: &Path,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let (mut items, mut diagnostics) = load_profile_import_items(Some(file), None)?;
+    if items.is_empty() && diagnostics.is_empty() {
+        return Err(miette!("no provider profile files found"));
+    }
+    if profile_diagnostics_have_errors(&diagnostics) {
+        print_profile_diagnostics(&diagnostics);
+        return Err(miette!("provider profile update failed"));
+    }
+
+    let mut client = grpc_client(server, tls).await?;
+    if let Some(item) = items.pop() {
+        let expected_resource_version = item
+            .profile
+            .as_ref()
+            .map_or(0, |profile| profile.resource_version);
+        let response = client
+            .update_provider_profiles(UpdateProviderProfilesRequest {
+                profile: Some(item),
+                expected_resource_version,
+                id: id.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        diagnostics.extend(response.diagnostics);
+        if response.updated {
+            println!("Updated provider profile.");
+            return Ok(());
+        }
+    }
+
+    print_profile_diagnostics(&diagnostics);
+    Err(miette!("provider profile update failed"))
 }
 
 pub async fn provider_profile_lint(
@@ -7626,9 +7777,10 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCredential, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
+        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
+        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -8332,9 +8484,12 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
+        let resource_requirements = ResourceRequirements {
+            gpu: Some(GpuResourceRequirements { count: None }),
+        };
         let message = provisioning_timeout_message(
             120,
-            true,
+            Some(&resource_requirements),
             Some("DependenciesNotReady: Pod exists with phase: Pending; Service Exists"),
         );
 
@@ -8345,7 +8500,15 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_omits_gpu_hint_for_non_gpu_requests() {
-        let message = provisioning_timeout_message(120, false, None);
+        let message = provisioning_timeout_message(120, None, None);
+
+        assert_eq!(message, "sandbox provisioning timed out after 120s");
+    }
+
+    #[test]
+    fn provisioning_timeout_message_omits_gpu_hint_without_gpu_requirements() {
+        let resource_requirements = ResourceRequirements { gpu: None };
+        let message = provisioning_timeout_message(120, Some(&resource_requirements), None);
 
         assert_eq!(message, "sandbox provisioning timed out after 120s");
     }
@@ -9231,5 +9394,227 @@ mod tests {
             );
             assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
         });
+    }
+
+    #[test]
+    fn provider_to_json_includes_core_fields() {
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            ..Default::default()
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert_eq!(json["id"], "prov-123");
+        assert_eq!(json["name"], "test-provider");
+        assert_eq!(json["type"], "anthropic");
+    }
+
+    #[test]
+    fn provider_to_json_exposes_credential_keys_not_values() {
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert("ANTHROPIC_API_KEY".to_string(), "secret-value".to_string());
+        credentials.insert("OTHER_KEY".to_string(), "other-secret".to_string());
+
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "anthropic".to_string(),
+            credentials,
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+        let json_str = json.to_string();
+
+        // Assert credential keys are present
+        let keys = json["credential_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|k| k.as_str() == Some("ANTHROPIC_API_KEY")));
+        assert!(keys.iter().any(|k| k.as_str() == Some("OTHER_KEY")));
+
+        // Assert credential values are NOT in the output (SECURITY)
+        assert!(
+            !json_str.contains("secret-value"),
+            "credential values must not be exposed"
+        );
+        assert!(
+            !json_str.contains("other-secret"),
+            "credential values must not be exposed"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_exposes_config_keys_not_values() {
+        let mut config = std::collections::HashMap::new();
+        config.insert("region".to_string(), "us-west".to_string());
+        config.insert(
+            "endpoint".to_string(),
+            "https://api.example.com".to_string(),
+        );
+
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "custom".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config,
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+        let json_str = json.to_string();
+
+        // Assert config keys are present
+        let keys = json["config_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|k| k.as_str() == Some("region")));
+        assert!(keys.iter().any(|k| k.as_str() == Some("endpoint")));
+
+        // Assert config values are NOT in the output (SECURITY)
+        assert!(
+            !json_str.contains("us-west"),
+            "config values must not be exposed"
+        );
+        assert!(
+            !json_str.contains("https://api.example.com"),
+            "config values must not be exposed"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_omits_empty_config() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(), // Empty config
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert!(
+            json.get("config_keys").is_none(),
+            "empty config_keys should be omitted"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_includes_metadata_fields_when_present() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            resource_version: 42,
+            created_at_ms: 1_234_567_890_000,
+            labels,
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert_eq!(json["resource_version"], 42);
+        assert_eq!(json["created_at"], "2009-02-13 23:31:30");
+        assert_eq!(json["labels"]["env"], "prod");
+    }
+
+    #[test]
+    fn provider_to_json_omits_zero_metadata_fields() {
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            // resource_version and created_at_ms are 0
+            // labels is empty
+            ..Default::default()
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert!(
+            json.get("resource_version").is_none(),
+            "zero resource_version should be omitted"
+        );
+        assert!(
+            json.get("created_at").is_none(),
+            "zero created_at should be omitted"
+        );
+        assert!(
+            json.get("labels").is_none(),
+            "empty labels should be omitted"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_includes_credential_expiration() {
+        let mut credential_expires_at_ms = std::collections::HashMap::new();
+        credential_expires_at_ms.insert("ACCESS_TOKEN".to_string(), 1_234_567_890);
+
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "oauth".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms,
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert_eq!(
+            json["credential_expires_at_ms"]["ACCESS_TOKEN"],
+            1_234_567_890
+        );
+    }
+
+    #[test]
+    fn provider_to_json_formats_created_at_as_human_readable() {
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            created_at_ms: 1_609_459_200_000, // 2021-01-01 00:00:00
+            ..Default::default()
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        // Should format as human-readable datetime, not raw milliseconds
+        assert_eq!(json["created_at"], "2021-01-01 00:00:00");
+        assert!(
+            json.get("created_at_ms").is_none(),
+            "raw milliseconds field should not exist"
+        );
     }
 }

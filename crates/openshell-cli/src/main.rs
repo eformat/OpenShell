@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_core::proto::GpuResourceRequirements;
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -26,6 +27,21 @@ struct GatewayContext {
     name: String,
     /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
     endpoint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuCliRequest {
+    DriverDefault,
+    Count(u32),
+}
+
+impl From<GpuCliRequest> for GpuResourceRequirements {
+    fn from(gpu: GpuCliRequest) -> Self {
+        match gpu {
+            GpuCliRequest::Count(count) => Self { count: Some(count) },
+            GpuCliRequest::DriverDefault => Self { count: None },
+        }
+    }
 }
 
 /// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
@@ -107,6 +123,21 @@ fn resolve_gateway(
         name: metadata.name,
         endpoint: metadata.gateway_endpoint,
     })
+}
+
+fn parse_gpu_request(value: &str) -> std::result::Result<GpuCliRequest, String> {
+    if value.is_empty() {
+        return Ok(GpuCliRequest::DriverDefault);
+    }
+
+    let count = value
+        .parse::<u32>()
+        .map_err(|_| "GPU count must be a positive integer".to_string())?;
+    if count == 0 {
+        return Err("GPU count must be greater than 0".to_string());
+    }
+
+    Ok(GpuCliRequest::Count(count))
 }
 
 fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
@@ -740,7 +771,7 @@ enum ProviderCommands {
 
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
-        /// Only valid for google-vertex-ai providers.
+        /// Valid for providers whose profile declares an ADC-compatible credential.
         #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
         from_gcloud_adc: bool,
 
@@ -777,8 +808,12 @@ enum ProviderCommands {
         offset: u32,
 
         /// Print only provider names, one per line.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         names: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "names")]
+        output: OutputFormat,
     },
 
     /// List available provider profiles.
@@ -924,6 +959,17 @@ enum ProviderProfileCommands {
         /// Directory containing profile files to import.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+    },
+
+    /// Update an existing custom provider profile from a file.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Existing provider profile id to update.
+        id: String,
+
+        /// Profile file to update.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: PathBuf,
     },
 
     /// Validate provider profile files without registering them.
@@ -1212,8 +1258,11 @@ enum SandboxCommands {
         editor: Option<CliEditor>,
 
         /// Request GPU resources for the sandbox.
-        #[arg(long)]
-        gpu: bool,
+        ///
+        /// Omit COUNT for the driver's default GPU selection, or pass COUNT
+        /// to request a specific number of GPUs.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
 
         /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
         #[arg(long)]
@@ -2085,7 +2134,7 @@ async fn main() -> Result<()> {
                 } else {
                     let name_width = forwards
                         .iter()
-                        .map(|f| f.sandbox.len())
+                        .map(|f| f.sandbox_name.len())
                         .max()
                         .unwrap_or(7)
                         .max(7);
@@ -2105,14 +2154,14 @@ async fn main() -> Result<()> {
                         bw = bind_width,
                     );
                     for f in &forwards {
-                        let status = if f.alive {
+                        let status = if f.validated_alive {
                             "running".green().to_string()
                         } else {
                             "dead".red().to_string()
                         };
                         println!(
                             "{:<nw$} {:<bw$} {:<8} {:<10} {}",
-                            f.sandbox,
+                            f.sandbox_name,
                             f.bind_addr,
                             f.port,
                             f.pid,
@@ -2621,6 +2670,7 @@ async fn main() -> Result<()> {
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
+                    let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
@@ -2633,7 +2683,7 @@ async fn main() -> Result<()> {
                         &ctx.name,
                         &upload_specs,
                         keep,
-                        gpu,
+                        gpu_requirements,
                         cpu.as_deref(),
                         memory.as_deref(),
                         driver_config_json.as_deref(),
@@ -2902,8 +2952,10 @@ async fn main() -> Result<()> {
                     limit,
                     offset,
                     names,
+                    output,
                 } => {
-                    run::provider_list(endpoint, limit, offset, names, &tls).await?;
+                    run::provider_list(endpoint, limit, offset, names, output.as_str(), &tls)
+                        .await?;
                 }
                 ProviderCommands::ListProfiles { output } => {
                     run::provider_list_profiles(endpoint, output.as_str(), &tls).await?;
@@ -2920,6 +2972,9 @@ async fn main() -> Result<()> {
                             &tls,
                         )
                         .await?;
+                    }
+                    ProviderProfileCommands::Update { id, file } => {
+                        run::provider_profile_update(endpoint, &id, &file, &tls).await?;
                     }
                     ProviderProfileCommands::Lint { file, from } => {
                         run::provider_profile_lint(
@@ -3629,6 +3684,27 @@ mod tests {
     }
 
     #[test]
+    fn gpu_cli_request_option_maps_absent_gpu_to_no_requirements() {
+        let gpu: Option<GpuResourceRequirements> = Option::<GpuCliRequest>::None.map(Into::into);
+
+        assert_eq!(gpu, None);
+    }
+
+    #[test]
+    fn gpu_cli_request_driver_default_converts_to_requirements() {
+        let gpu = GpuResourceRequirements::from(GpuCliRequest::DriverDefault);
+
+        assert_eq!(gpu.count, None);
+    }
+
+    #[test]
+    fn gpu_cli_request_count_converts_to_requirements() {
+        let gpu = GpuResourceRequirements::from(GpuCliRequest::Count(2));
+
+        assert_eq!(gpu.count, Some(2));
+    }
+
+    #[test]
     fn apply_auth_uses_stored_token() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
@@ -3759,6 +3835,26 @@ mod tests {
             })
         ));
 
+        let update = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "update",
+            "custom-api",
+            "-f",
+            "./profiles/custom-api.yaml",
+        ])
+        .expect("provider profile update should parse");
+        assert!(matches!(
+            update.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Update {
+                    id,
+                    file: _
+                }))
+            }) if id == "custom-api"
+        ));
+
         let delete =
             Cli::try_parse_from(["openshell", "provider", "profile", "delete", "custom-api"])
                 .expect("provider profile delete should parse");
@@ -3875,6 +3971,52 @@ mod tests {
                 })
             })
         ));
+    }
+
+    #[test]
+    fn provider_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list", "-o", "json"])
+            .expect("provider list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list", "-o", "yaml"])
+            .expect("provider list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Yaml,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_output_conflicts_with_names() {
+        let result =
+            Cli::try_parse_from(["openshell", "provider", "list", "-o", "json", "--names"]);
+        assert!(result.is_err(), "--names and -o should conflict");
+    }
+
+    #[test]
+    fn provider_list_names_conflicts_with_output() {
+        let result =
+            Cli::try_parse_from(["openshell", "provider", "list", "--names", "-o", "yaml"]);
+        assert!(result.is_err(), "--names and -o should conflict");
     }
 
     #[test]
@@ -4441,6 +4583,113 @@ mod tests {
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_parses_driver_default() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu"])
+            .expect("sandbox create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_parses_from_gpu_flag() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "2"])
+            .expect("sandbox create --gpu 2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_driver_default_allows_trailing_command() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "--", "claude"])
+            .expect("sandbox create --gpu -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_allows_trailing_command() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--gpu",
+            "2",
+            "--",
+            "claude",
+        ])
+        .expect("sandbox create --gpu 2 -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_zero() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "0"]);
+
+        assert!(result.is_err(), "sandbox create --gpu 0 should be rejected");
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_accepts_equals_syntax() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu=2"])
+            .expect("sandbox create --gpu=2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_non_integer() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "many"]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create --gpu many should be rejected"
+        );
     }
 
     #[test]

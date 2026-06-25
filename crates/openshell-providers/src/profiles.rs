@@ -20,11 +20,14 @@ use std::sync::OnceLock;
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
+    include_str!("../../../providers/aws-bedrock.yaml"),
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/codex.yaml"),
     include_str!("../../../providers/copilot.yaml"),
     include_str!("../../../providers/cursor.yaml"),
+    include_str!("../../../providers/deepinfra.yaml"),
     include_str!("../../../providers/github.yaml"),
+    include_str!("../../../providers/google-cloud.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/pypi.yaml"),
@@ -273,6 +276,8 @@ pub struct BinaryProfile {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderTypeProfile {
     pub id: String,
+    #[serde(default, skip_serializing_if = "is_u64_zero")]
+    pub resource_version: u64,
     pub display_name: String,
     #[serde(default)]
     pub description: String,
@@ -303,6 +308,7 @@ impl ProviderTypeProfile {
     pub fn from_proto(profile: &ProviderProfile) -> Self {
         Self {
             id: profile.id.clone(),
+            resource_version: profile.resource_version,
             display_name: profile.display_name.clone(),
             description: profile.description.clone(),
             category: ProviderProfileCategory::try_from(profile.category)
@@ -369,10 +375,30 @@ impl ProviderTypeProfile {
         has_runtime_resolvable_credential
     }
 
+    /// Returns the credential suitable for `--from-gcloud-adc` bootstrap, if any.
+    ///
+    /// A credential qualifies when its refresh strategy is `Oauth2RefreshToken`
+    /// and its material declares the three gcloud ADC keys (`client_id`,
+    /// `client_secret`, `refresh_token`).
+    #[must_use]
+    pub fn adc_credential(&self) -> Option<&CredentialProfile> {
+        const ADC_MATERIAL_KEYS: &[&str] = &["client_id", "client_secret", "refresh_token"];
+
+        self.credentials.iter().find(|cred| {
+            cred.refresh.as_ref().is_some_and(|refresh| {
+                refresh.strategy == ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                    && ADC_MATERIAL_KEYS
+                        .iter()
+                        .all(|key| refresh.material.iter().any(|m| m.name == *key))
+            })
+        })
+    }
+
     #[must_use]
     pub fn to_proto(&self) -> ProviderProfile {
         ProviderProfile {
             id: self.id.clone(),
+            resource_version: self.resource_version,
             display_name: self.display_name.clone(),
             description: self.description.clone(),
             category: self.category as i32,
@@ -408,6 +434,11 @@ impl ProviderTypeProfile {
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_u64_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl CredentialProfile {
@@ -1789,6 +1820,73 @@ credentials:
     }
 
     #[test]
+    fn adc_credential_returns_oauth2_refresh_token_credential_with_adc_material() {
+        let profile = get_default_profile("google-cloud").expect("google-cloud profile");
+        let adc = profile
+            .adc_credential()
+            .expect("google-cloud should have an ADC credential");
+        assert_eq!(adc.env_vars[0], "GCP_ADC_ACCESS_TOKEN");
+
+        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let adc = profile
+            .adc_credential()
+            .expect("vertex should have an ADC credential");
+        assert_eq!(adc.env_vars[0], "GOOGLE_VERTEX_AI_TOKEN");
+    }
+
+    #[test]
+    fn adc_credential_returns_none_for_profiles_without_adc() {
+        let profile = get_default_profile("github").expect("github profile");
+        assert!(profile.adc_credential().is_none());
+
+        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        assert!(profile.adc_credential().is_none());
+    }
+
+    #[test]
+    fn adc_credential_rejects_service_account_jwt_strategy() {
+        let profile = parse_profile_yaml(
+            r"
+id: sa-only
+display_name: SA Only
+credentials:
+  - name: sa_token
+    env_vars: [SA_TOKEN]
+    refresh:
+      strategy: google_service_account_jwt
+      material:
+        - name: client_email
+        - name: private_key
+",
+        )
+        .expect("profile");
+        assert!(profile.adc_credential().is_none());
+    }
+
+    #[test]
+    fn adc_credential_requires_all_three_material_keys() {
+        let profile = parse_profile_yaml(
+            r"
+id: partial-material
+display_name: Partial Material
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    refresh:
+      strategy: oauth2_refresh_token
+      material:
+        - name: client_id
+        - name: client_secret
+",
+        )
+        .expect("profile");
+        assert!(
+            profile.adc_credential().is_none(),
+            "missing refresh_token material should not qualify"
+        );
+    }
+
+    #[test]
     fn parse_profile_yaml_reads_single_provider_document() {
         let profile = parse_profile_yaml(
             r"
@@ -2395,6 +2493,7 @@ binaries: ["", /usr/bin/broken]
                 "space.yaml".to_string(),
                 ProviderTypeProfile {
                     id: " alex-api ".to_string(),
+                    resource_version: 0,
                     display_name: "Space".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2409,6 +2508,7 @@ binaries: ["", /usr/bin/broken]
                 "underscore.yaml".to_string(),
                 ProviderTypeProfile {
                     id: "alex_api".to_string(),
+                    resource_version: 0,
                     display_name: "Underscore".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2423,6 +2523,7 @@ binaries: ["", /usr/bin/broken]
                 "case.yaml".to_string(),
                 ProviderTypeProfile {
                     id: "Alex-API".to_string(),
+                    resource_version: 0,
                     display_name: "Case".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,

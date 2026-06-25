@@ -148,6 +148,7 @@ build_component_for_arch() {
   local build_target
   local current_host_os
   local current_host_arch
+  local binary_path
 
   resolve_component "$component"
   target="$(target_triple "$arch" "$target_libc")"
@@ -165,9 +166,9 @@ build_component_for_arch() {
   if [[ "$component" == "gateway" ]]; then
     if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
-      build_target="${target}.2.31"
+      build_target="${target}.2.28"
     else
-      echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.31 floor." >&2
+      echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.28 floor." >&2
       exit 1
     fi
   elif [[ "$target_libc" == "musl" ]] && has_cargo_zigbuild; then
@@ -198,14 +199,22 @@ build_component_for_arch() {
 
   (
     cd "$ROOT"
+    if [[ "$component" == "gateway" ]]; then
+      eval "$("$SCRIPT_DIR/setup-zig-cc-wrapper.sh" "$build_target" "$build_target" "$ROOT/target/zig-gnu-wrapper/$arch")"
+    fi
     if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
       export GIT_DIR=/nonexistent
     fi
     CARGO_INCREMENTAL=0 mise x -- "${cargo_subcommand[@]}" "${args[@]}"
   )
 
+  binary_path="${ROOT}/target/${target}/release/${binary}"
+  if [[ "$component" == "gateway" ]]; then
+    "$SCRIPT_DIR/verify-glibc-symbols.sh" 2.28 "$binary_path"
+  fi
+
   mkdir -p "$stage"
-  install -m 0755 "${ROOT}/target/${target}/release/${binary}" "${stage}/${binary}"
+  install -m 0755 "$binary_path" "${stage}/${binary}"
   ls -lh "${stage}/${binary}"
 }
 

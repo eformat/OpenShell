@@ -13,6 +13,14 @@
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
+#
+# Sandbox image overrides:
+#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
+#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=Always|IfNotPresent|Never
+#
+# The default community sandbox image uses :latest. This wrapper refreshes it
+# before starting the gateway, while the Docker driver defaults to IfNotPresent
+# so local Dockerfile-built images remain usable.
 
 set -euo pipefail
 
@@ -26,6 +34,36 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/e2e/support/gateway-common.sh"
 
 e2e_preserve_mise_dirs
+
+require_container_engine_lane() {
+  local lane=$1
+  local label=$2
+  local selected_engine selected_driver
+
+  if [ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]; then
+    echo "ERROR: OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} for the ${label} e2e lane, or unset it." >&2
+    exit 2
+  fi
+  selected_engine="$(printf '%s' "${CONTAINER_ENGINE:-}" | tr '[:upper:]' '[:lower:]')"
+  selected_driver="$(printf '%s' "${OPENSHELL_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
+
+  if [ -n "${selected_engine}" ] && [ "${selected_engine}" != "${lane}" ]; then
+    echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} conflicts with the ${label} e2e lane." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} or unset CONTAINER_ENGINE." >&2
+    exit 2
+  fi
+  if [ -n "${selected_driver}" ] && [ "${selected_driver}" != "${lane}" ]; then
+    echo "ERROR: OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
+    echo "       Set OPENSHELL_E2E_DRIVER=${lane} or unset OPENSHELL_E2E_DRIVER." >&2
+    exit 2
+  fi
+
+  export CONTAINER_ENGINE="${lane}"
+  export OPENSHELL_E2E_DRIVER="${lane}"
+}
+
+require_container_engine_lane docker Docker
 
 github_actions_host_docker_tmpdir() {
   if [ "${GITHUB_ACTIONS:-}" != "true" ] \
@@ -226,8 +264,7 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
     "$(e2e_endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
-  export OPENSHELL_E2E_DRIVER="${OPENSHELL_E2E_DRIVER:-docker}"
-  export OPENSHELL_E2E_CONTAINER_ENGINE="${OPENSHELL_E2E_CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_DRIVER="docker"
 
   echo "Using existing e2e gateway endpoint: ${OPENSHELL_GATEWAY_ENDPOINT}"
   "$@"
@@ -342,6 +379,41 @@ ensure_docker_supervisor_image() {
   exit 2
 }
 
+image_uses_latest_tag() {
+  local image=$1
+  local last_component
+
+  # Digest references are immutable even if the tag portion says latest.
+  if [[ "${image}" == *@* ]]; then
+    return 1
+  fi
+
+  last_component="${image##*/}"
+  # Docker treats an omitted tag as :latest.
+  if [[ "${last_component}" != *:* ]]; then
+    return 0
+  fi
+
+  [[ "${last_component}" == *:latest ]]
+}
+
+ensure_sandbox_image_available() {
+  local image=$1
+
+  if image_uses_latest_tag "${image}"; then
+    echo "Refreshing latest sandbox image ${image}..."
+    docker_pull_with_retry "${image}"
+    return
+  fi
+
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "Pulling ${image}..."
+  docker_pull_with_retry "${image}"
+}
+
 DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
 SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 HOST_OS="$(uname -s)"
@@ -386,12 +458,10 @@ fi
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
-if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
-  echo "Pulling ${SANDBOX_IMAGE}..."
-  if ! docker_pull_with_retry "${SANDBOX_IMAGE}"; then
-    echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
-    exit 2
-  fi
+SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}}"
+if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
+  echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
+  exit 2
 fi
 
 PKI_DIR="${WORKDIR}/pki"
@@ -412,7 +482,6 @@ export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
-export OPENSHELL_E2E_CONTAINER_ENGINE="docker"
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
 else
@@ -420,6 +489,7 @@ else
 fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"
 
 # Driver-specific options moved from CLI flags into a TOML config table
@@ -446,7 +516,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
   printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
   printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
-  printf 'image_pull_policy = "IfNotPresent"\n'
+  printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
   printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"

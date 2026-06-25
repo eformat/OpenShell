@@ -20,10 +20,11 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
+    GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
+    ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -50,6 +51,8 @@ use tracing::{debug, info, warn};
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 
 #[tonic::async_trait]
 trait ShutdownCleanup: Send + Sync {
@@ -282,10 +285,10 @@ impl ComputeRuntime {
         })
     }
 
-    /// Serializes sandbox object read-modify-write operations within this
-    /// gateway process.
+    /// Serializes sandbox/provider-profile invariant checks and object writes
+    /// within this gateway process.
     ///
-    /// This is a temporary single-gateway guard for full-object sandbox writes.
+    /// This is a temporary single-gateway guard for cross-object invariants.
     /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
     /// tracked by #1255 before enabling multiple gateway writers.
     pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -540,17 +543,7 @@ impl ComputeRuntime {
 
         let id = sandbox.object_id().to_string();
 
-        // Use CAS to set phase to Deleting
-        // TODO: Accept expected_version from DeleteSandboxRequest for proper client-driven CAS
-        let sandbox = self
-            .store
-            .update_message_cas::<Sandbox, _>(&id, 0, |s| {
-                s.set_phase(SandboxPhase::Deleting as i32);
-            })
-            .await
-            .map_err(|e| {
-                crate::grpc::persistence_error_to_status(e, "set sandbox phase to Deleting")
-            })?;
+        let sandbox = self.set_sandbox_phase_deleting_with_retry(&id).await?;
 
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(&id);
@@ -572,6 +565,114 @@ impl ComputeRuntime {
 
         self.cleanup_sandbox_state(&id);
         Ok(deleted)
+    }
+
+    async fn set_sandbox_phase_deleting_with_retry(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Sandbox, Status> {
+        self.set_sandbox_phase_deleting_with_initial_snapshot(sandbox_id, None)
+            .await
+    }
+
+    async fn set_sandbox_phase_deleting_with_initial_snapshot(
+        &self,
+        sandbox_id: &str,
+        mut initial_snapshot: Option<Sandbox>,
+    ) -> Result<Sandbox, Status> {
+        let operation = "set sandbox phase to Deleting";
+
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            let sandbox = match initial_snapshot.take() {
+                Some(sandbox) => sandbox,
+                None => self
+                    .store
+                    .get_message::<Sandbox>(sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?,
+            };
+
+            match self
+                .write_sandbox_phase_deleting_from_snapshot(sandbox)
+                .await
+            {
+                Ok(sandbox) => {
+                    if attempt > 1 {
+                        debug!(
+                            sandbox_id,
+                            attempt, "Retried sandbox delete phase transition after CAS conflict"
+                        );
+                    }
+                    return Ok(sandbox);
+                }
+                Err(crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                }) => {
+                    let err = crate::persistence::PersistenceError::Conflict {
+                        current_resource_version,
+                    };
+                    if attempt == DELETE_PHASE_CAS_RETRY_LIMIT {
+                        return Err(crate::grpc::persistence_error_to_status(err, operation));
+                    }
+                    debug!(
+                        sandbox_id,
+                        attempt,
+                        current_resource_version,
+                        "Sandbox delete phase transition conflicted; retrying"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(crate::grpc::persistence_error_to_status(err, operation)),
+            }
+        }
+
+        unreachable!("delete phase retry loop always returns")
+    }
+
+    async fn write_sandbox_phase_deleting_from_snapshot(
+        &self,
+        mut sandbox: Sandbox,
+    ) -> crate::persistence::PersistenceResult<Sandbox> {
+        let id = sandbox.object_id().to_string();
+        let name = sandbox.object_name().to_string();
+        let expected_resource_version = sandbox
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+
+        sandbox.set_phase(SandboxPhase::Deleting as i32);
+
+        let labels_json = sandbox
+            .metadata
+            .as_ref()
+            .map(|metadata| &metadata.labels)
+            .filter(|labels| !labels.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                crate::persistence::PersistenceError::Encode(format!(
+                    "failed to serialize labels: {e}"
+                ))
+            })?;
+
+        let result = self
+            .store
+            .put_if(
+                Sandbox::object_type(),
+                &id,
+                &name,
+                &sandbox.encode_to_vec(),
+                labels_json.as_deref(),
+                WriteCondition::MatchResourceVersion(expected_resource_version),
+            )
+            .await?;
+
+        if let Some(metadata) = sandbox.metadata.as_mut() {
+            metadata.resource_version = result.resource_version;
+        }
+
+        Ok(sandbox)
     }
 
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
@@ -1400,7 +1501,14 @@ fn driver_sandbox_spec_from_public(
             .as_ref()
             .map(|template| driver_sandbox_template_from_public(template, driver_kind))
             .transpose()?,
-        gpu: spec.gpu,
+        resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
+            DriverSandboxResourceRequirements {
+                gpu: requirements
+                    .gpu
+                    .as_ref()
+                    .map(|gpu| DriverGpuResourceRequirements { count: gpu.count }),
+            }
+        }),
         sandbox_token: String::new(),
     })
 }
@@ -1781,7 +1889,9 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
 }
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
-    let gpu_requested = spec.is_some_and(|sandbox_spec| sandbox_spec.gpu);
+    let gpu_requested = spec
+        .and_then(|sandbox_spec| sandbox_spec.resource_requirements.as_ref())
+        .is_some_and(|requirements| openshell_core::gpu::sandbox_gpu_requested(Some(requirements)));
     if !gpu_requested {
         return;
     }
@@ -1976,6 +2086,26 @@ mod tests {
                     .collect(),
             })),
         }
+    }
+
+    #[test]
+    fn driver_sandbox_spec_from_public_preserves_gpu_requirement() {
+        let public = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            }),
+            ..Default::default()
+        };
+
+        let driver =
+            driver_sandbox_spec_from_public(&public, None).expect("driver spec should map");
+
+        let gpu = driver
+            .resource_requirements
+            .as_ref()
+            .and_then(|requirements| requirements.gpu.as_ref())
+            .expect("driver GPU requirement should be set");
+        assert_eq!(gpu.count, Some(2));
     }
 
     #[test]
@@ -2484,7 +2614,9 @@ mod tests {
         rewrite_user_facing_conditions(
             &mut status,
             Some(&SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                }),
                 ..Default::default()
             }),
         );
@@ -2512,13 +2644,7 @@ mod tests {
             ..Default::default()
         });
 
-        rewrite_user_facing_conditions(
-            &mut status,
-            Some(&SandboxSpec {
-                gpu: false,
-                ..Default::default()
-            }),
-        );
+        rewrite_user_facing_conditions(&mut status, Some(&SandboxSpec::default()));
 
         assert_eq!(status.unwrap().conditions[0].message, original);
     }
@@ -2534,6 +2660,58 @@ mod tests {
             compute_error_from_status(Status::failed_precondition("sandbox agent pod IP is not available")),
             ComputeError::Precondition(message) if message == "sandbox agent pod IP is not available"
         ));
+    }
+
+    #[tokio::test]
+    async fn set_sandbox_phase_deleting_retries_after_stale_snapshot_conflict() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let stale_snapshot = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |sandbox| {
+                sandbox.set_current_policy_version(7);
+            })
+            .await
+            .unwrap();
+
+        let updated = runtime
+            .set_sandbox_phase_deleting_with_initial_snapshot("sb-1", Some(stale_snapshot))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SandboxPhase::try_from(updated.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert_eq!(updated.current_policy_version(), 7);
+        assert_eq!(
+            updated
+                .metadata
+                .as_ref()
+                .map_or(0, |metadata| metadata.resource_version),
+            3
+        );
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert_eq!(stored.current_policy_version(), 7);
     }
 
     #[tokio::test]
@@ -2797,7 +2975,9 @@ mod tests {
 
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                }),
                 ..Default::default()
             }),
             ..sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning)
@@ -2820,7 +3000,9 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
-        assert!(stored.spec.as_ref().is_some_and(|spec| spec.gpu));
+        assert!(stored.spec.as_ref().is_some_and(|spec| {
+            openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
+        }));
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
+use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE,
@@ -13,11 +13,12 @@ use openshell_core::progress::{
     PROGRESS_STEP_STARTING_SANDBOX,
 };
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate, GpuResourceRequirements,
+    ResourceRequirements,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tempfile::TempDir;
 
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
@@ -41,7 +42,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 ..Default::default()
             }),
-            gpu: false,
+            resource_requirements: None,
             sandbox_token: String::new(),
         }),
         status: None,
@@ -79,6 +80,12 @@ fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struc
     }
 }
 
+fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
+    ResourceRequirements {
+        gpu: Some(GpuResourceRequirements { count }),
+    }
+}
+
 fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
@@ -104,6 +111,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
+        allow_all_default_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         enable_bind_mounts: false,
     }
@@ -158,6 +166,32 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
         cluster_volume: None,
         options,
         usage_data: None,
+    }
+}
+
+struct DisconnectedSupervisorReadiness;
+
+impl SupervisorReadiness for DisconnectedSupervisorReadiness {
+    fn is_supervisor_connected(&self, _sandbox_id: &str) -> bool {
+        false
+    }
+}
+
+fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
+    let allow_all_default_gpu = config.allow_all_default_gpu;
+    DockerComputeDriver {
+        docker: Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:2375", 1, bollard::API_DEFAULT_VERSION)
+                .expect("construct test Docker client"),
+        ),
+        config,
+        events: broadcast::channel(WATCH_BUFFER).0,
+        pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        supervisor_readiness: Arc::new(DisconnectedSupervisorReadiness),
+        gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
+            CdiGpuInventory::default(),
+            allow_all_default_gpu,
+        )),
     }
 }
 
@@ -1021,7 +1055,21 @@ fn build_container_create_body_clears_inherited_cmd() {
 fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn validate_sandbox_rejects_missing_gpu_support_before_request_shape() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
 
@@ -1034,7 +1082,7 @@ fn validate_sandbox_rejects_invalid_cdi_devices_before_gpu_capability() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources(None));
     spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
@@ -1049,7 +1097,7 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources(None));
     spec.template.as_mut().unwrap().driver_config =
         Some(cdi_device_typo_config(&["nvidia.com/gpu=0"]));
 
@@ -1060,11 +1108,110 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 }
 
 #[test]
+fn validate_sandbox_accepts_gpu_count_request_shape() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(Some(2)));
+
+    DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect("default GPU count shape should be accepted before inventory selection");
+}
+
+#[test]
+fn validate_sandbox_accepts_gpu_count_matching_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[
+        "nvidia.com/gpu=0",
+        "nvidia.com/gpu=1",
+    ]));
+
+    DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect("matching explicit CDI device count should be accepted");
+}
+
+#[test]
+fn validate_sandbox_accepts_single_cdi_device_without_gpu_count() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect("single exact CDI device should be compatible with a default GPU request");
+}
+
+#[test]
+fn validate_sandbox_rejects_multiple_cdi_devices_without_gpu_count() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[
+        "nvidia.com/gpu=0",
+        "nvidia.com/gpu=1",
+    ]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("gpu count (1) must match driver_config.cdi_devices length (2)")
+    );
+}
+
+#[test]
+fn validate_sandbox_rejects_cdi_devices_without_gpu_request() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("requires a gpu request"));
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_count_mismatched_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("gpu count (2) must match driver_config.cdi_devices length (1)")
+    );
+}
+
+#[test]
 fn validate_sandbox_rejects_template_errors_before_device_config() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources(None));
     let template = spec.template.as_mut().unwrap();
     template.agent_socket_path = "/tmp/agent.sock".to_string();
     template.driver_config = Some(cdi_devices_config(&[]));
@@ -1098,13 +1245,21 @@ fn validate_sandbox_auth_accepts_gateway_token() {
 }
 
 #[test]
-fn build_container_create_body_maps_gpu_to_all_cdi_device() {
+fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
-    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let driver_config = DockerSandboxDriverConfig::default();
+    let gpu_devices = vec!["nvidia.com/gpu=1".to_string()];
+    let create_body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &config,
+        &driver_config,
+        Some(&gpu_devices),
+    )
+    .unwrap();
     let request = create_body
         .host_config
         .as_ref()
@@ -1115,7 +1270,25 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     assert_eq!(request.driver.as_deref(), Some("cdi"));
     assert_eq!(
         request.device_ids.as_ref().unwrap(),
-        &vec![CDI_GPU_DEVICE_ALL.to_string()]
+        &vec!["nvidia.com/gpu=1".to_string()]
+    );
+}
+
+#[test]
+fn build_container_create_body_omits_devices_without_resolved_default_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|host_config| host_config.device_requests.as_ref())
+            .is_none()
     );
 }
 
@@ -1125,7 +1298,7 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources(None));
     spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
@@ -1144,7 +1317,25 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
 }
 
 #[test]
-fn build_container_create_body_rejects_cdi_devices_without_gpu() {
+fn build_container_create_body_rejects_gpu_count_mismatched_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("gpu count (2) must match driver_config.cdi_devices length (1)")
+    );
+}
+
+#[test]
+fn build_container_create_body_rejects_cdi_devices_without_gpu_request() {
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -1157,19 +1348,136 @@ fn build_container_create_body_rejects_cdi_devices_without_gpu() {
 
     let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("requires gpu=true"));
+    assert!(err.message().contains("requires a gpu request"));
 }
 
 #[test]
 fn build_container_create_body_rejects_empty_cdi_devices() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources(None));
     spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
 
     let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("non-empty list"));
+}
+
+#[test]
+fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let driver = test_driver_with_config(config);
+    driver.gpu_selector.refresh(
+        CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),
+        false,
+    );
+    let mut first_sandbox = test_sandbox();
+    first_sandbox.id = "sbx-first".to_string();
+    first_sandbox.name = "first".to_string();
+    first_sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    let mut second_sandbox = test_sandbox();
+    second_sandbox.id = "sbx-second".to_string();
+    second_sandbox.name = "second".to_string();
+    second_sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+
+    DockerComputeDriver::validate_sandbox(&first_sandbox, &driver.config).unwrap();
+    assert_eq!(
+        driver.gpu_selector.peek_device_ids(1).unwrap(),
+        vec!["nvidia.com/gpu=0".to_string()]
+    );
+    let first_devices = driver.gpu_selector.next_device_ids(1).unwrap();
+    let driver_config = DockerSandboxDriverConfig::default();
+    let first_create_body = build_container_create_body_with_gpu_devices(
+        &first_sandbox,
+        &driver.config,
+        &driver_config,
+        Some(&first_devices),
+    )
+    .unwrap();
+
+    DockerComputeDriver::validate_sandbox(&second_sandbox, &driver.config).unwrap();
+    assert_eq!(
+        driver.gpu_selector.peek_device_ids(1).unwrap(),
+        vec!["nvidia.com/gpu=1".to_string()]
+    );
+    let second_devices = driver.gpu_selector.next_device_ids(1).unwrap();
+    let second_create_body = build_container_create_body_with_gpu_devices(
+        &second_sandbox,
+        &driver.config,
+        &driver_config,
+        Some(&second_devices),
+    )
+    .unwrap();
+
+    let first_request = first_create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("first default GPU request should add a Docker device request");
+    let second_request = second_create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("second default GPU request should add a Docker device request");
+
+    assert_eq!(
+        first_request.device_ids.as_ref().unwrap(),
+        &vec!["nvidia.com/gpu=0".to_string()]
+    );
+    assert_eq!(
+        second_request.device_ids.as_ref().unwrap(),
+        &vec!["nvidia.com/gpu=1".to_string()]
+    );
+}
+
+#[test]
+fn docker_info_reports_wsl2_from_kernel_version() {
+    let info = SystemInfo {
+        kernel_version: Some("5.15.153.1-microsoft-standard-WSL2".to_string()),
+        operating_system: Some("Docker Desktop".to_string()),
+        ..Default::default()
+    };
+
+    assert!(docker_info_reports_wsl2(&info));
+}
+
+#[test]
+fn docker_info_reports_wsl2_from_operating_system() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04.4 LTS on WSL2".to_string()),
+        ..Default::default()
+    };
+
+    assert!(docker_info_reports_wsl2(&info));
+}
+
+#[test]
+fn docker_info_reports_wsl2_ignores_daemon_name_and_labels() {
+    let info = SystemInfo {
+        kernel_version: Some("6.8.0-60-generic".to_string()),
+        operating_system: Some("Ubuntu 24.04.4 LTS".to_string()),
+        name: Some("wsl-docker-daemon".to_string()),
+        labels: Some(vec!["com.example.platform=wsl2".to_string()]),
+        ..Default::default()
+    };
+
+    assert!(!docker_info_reports_wsl2(&info));
+}
+
+#[test]
+fn docker_info_reports_wsl2_rejects_plain_linux() {
+    let info = SystemInfo {
+        kernel_version: Some("6.8.0-60-generic".to_string()),
+        operating_system: Some("Ubuntu 24.04.4 LTS".to_string()),
+        os_type: Some("linux".to_string()),
+        architecture: Some("x86_64".to_string()),
+        ..Default::default()
+    };
+
+    assert!(!docker_info_reports_wsl2(&info));
 }
 
 #[test]
