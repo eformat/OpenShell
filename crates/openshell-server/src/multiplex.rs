@@ -12,7 +12,7 @@ use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
@@ -187,7 +187,10 @@ impl MultiplexService {
         let mut builder = Builder::new(TokioExecutor::new());
         builder
             .http2()
+            .timer(TokioTimer::new())
             .adaptive_window(true)
+            .keep_alive_interval(Some(Duration::from_secs(20)))
+            .keep_alive_timeout(Duration::from_secs(10))
             .enable_connect_protocol();
 
         builder

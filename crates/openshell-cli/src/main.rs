@@ -898,6 +898,11 @@ enum ProviderRefreshCommands {
         #[arg(long = "material", value_name = "KEY=VALUE")]
         material: Vec<String>,
 
+        /// Secret refresh material resolved from the CLI environment
+        /// (`ENVVAR` defaults to `KEY`); `KEY` is auto-marked secret.
+        #[arg(long = "secret-material-env", value_name = "KEY[=ENVVAR]")]
+        secret_material_env: Vec<String>,
+
         /// Material keys that are secret and must not be exposed.
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
@@ -1693,9 +1698,13 @@ enum PolicyCommands {
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Include the full policy payload.
-        #[arg(long)]
+        /// Include the effective policy payload, including provider-composed entries.
+        #[arg(long, conflicts_with = "base")]
         full: bool,
+
+        /// Include the base policy payload without provider-composed entries.
+        #[arg(long)]
+        base: bool,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
@@ -2378,14 +2387,16 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    base,
                     output,
                     global,
                 } => {
+                    let view = run::PolicyGetView::from_flags(base, full);
                     if global {
                         run::sandbox_policy_get_global(
                             &ctx.endpoint,
                             rev,
-                            full,
+                            view,
                             output.as_str(),
                             &tls,
                         )
@@ -2396,7 +2407,7 @@ async fn main() -> Result<()> {
                             &ctx.endpoint,
                             &name,
                             rev,
-                            full,
+                            view,
                             output.as_str(),
                             &tls,
                         )
@@ -2678,25 +2689,27 @@ async fn main() -> Result<()> {
                     apply_auth(&mut tls, &ctx.name);
                     Box::pin(run::sandbox_create(
                         endpoint,
-                        name.as_deref(),
-                        from.as_deref(),
                         &ctx.name,
-                        &upload_specs,
-                        keep,
-                        gpu_requirements,
-                        cpu.as_deref(),
-                        memory.as_deref(),
-                        driver_config_json.as_deref(),
-                        editor,
-                        &providers,
-                        policy.as_deref(),
-                        forward,
-                        &command,
-                        tty_override,
-                        auto_providers_override,
-                        &labels_map,
-                        &env_map,
-                        &approval_mode,
+                        run::SandboxCreateConfig {
+                            name: name.as_deref(),
+                            from: from.as_deref(),
+                            uploads: &upload_specs,
+                            keep,
+                            gpu_requirements,
+                            cpu: cpu.as_deref(),
+                            memory: memory.as_deref(),
+                            driver_config_json: driver_config_json.as_deref(),
+                            editor,
+                            providers: &providers,
+                            policy: policy.as_deref(),
+                            forward,
+                            command: &command,
+                            tty_override,
+                            auto_providers_override,
+                            labels: labels_map,
+                            environment: env_map,
+                            approval_mode: &approval_mode,
+                        },
                         &tls,
                     ))
                     .await?;
@@ -2914,6 +2927,7 @@ async fn main() -> Result<()> {
                         credential_key,
                         strategy,
                         material,
+                        secret_material_env,
                         secret_material_keys,
                         credential_expires_at,
                     } => {
@@ -2924,6 +2938,7 @@ async fn main() -> Result<()> {
                                 credential_key: &credential_key,
                                 strategy: strategy.as_str(),
                                 material: &material,
+                                secret_material_env: &secret_material_env,
                                 secret_material_keys: &secret_material_keys,
                                 credential_expires_at_ms: credential_expires_at,
                             },
@@ -4181,6 +4196,8 @@ mod tests {
             "oauth2-client-credentials",
             "--material",
             "tenant_id=abc",
+            "--secret-material-env",
+            "client_secret=GRAPH_CLIENT_SECRET",
             "--secret-material-key",
             "client_secret",
             "--credential-expires-at",
@@ -4194,10 +4211,11 @@ mod tests {
                     ProviderRefreshCommands::Configure {
                         strategy: CliProviderRefreshStrategy::Oauth2ClientCredentials,
                         credential_expires_at: Some(1_767_225_600_000),
+                        ref secret_material_env,
                         ..
                     }
                 ))
-            })
+            }) if secret_material_env == &["client_secret=GRAPH_CLIENT_SECRET".to_string()]
         ));
 
         let rotate = Cli::try_parse_from([
@@ -4364,12 +4382,37 @@ mod tests {
             Some(Commands::Policy {
                 command:
                     Some(PolicyCommands::Get {
-                        name, full, output, ..
+                        name,
+                        full,
+                        base,
+                        output,
+                        ..
                     }),
             }) => {
                 assert_eq!(name.as_deref(), Some("my-sandbox"));
                 assert!(full);
+                assert!(!base);
                 assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_base_output_parses() {
+        let cli = Cli::try_parse_from(["openshell", "policy", "get", "my-sandbox", "--base"])
+            .expect("policy get --base should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, base, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(!full);
+                assert!(base);
             }
             other => panic!("expected policy get command, got: {other:?}"),
         }

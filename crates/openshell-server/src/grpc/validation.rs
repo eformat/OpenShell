@@ -32,8 +32,10 @@ pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
 
-/// Validate fields of an `ExecSandboxRequest` for control characters and size
-/// limits before constructing a shell command string.
+/// Validate exec request size limits and field-specific character constraints.
+///
+/// Command arguments only reject NUL (newlines are valid for inline scripts).
+/// Environment values and workdir reject both NUL and newlines.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
         return Err(Status::invalid_argument(format!(
@@ -46,7 +48,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
                 "command argument {i} exceeds {MAX_EXEC_ARG_LEN} byte limit"
             )));
         }
-        reject_control_chars(arg, &format!("command argument {i}"))?;
+        reject_null_char(arg, &format!("command argument {i}"))?;
     }
     for (key, value) in &req.environment {
         if value.len() > MAX_EXEC_ARG_LEN {
@@ -70,11 +72,23 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
 
 /// Reject null bytes and newlines in a user-supplied value.
 pub(super) fn reject_control_chars(value: &str, field_name: &str) -> Result<(), Status> {
+    reject_null_char(value, field_name)?;
+    reject_newline_chars(value, field_name)?;
+    Ok(())
+}
+
+/// Reject null bytes in a user-supplied value.
+pub(super) fn reject_null_char(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == 0) {
         return Err(Status::invalid_argument(format!(
             "{field_name} contains null bytes"
         )));
     }
+    Ok(())
+}
+
+/// Reject newline and carriage return characters in a user-supplied value.
+pub(super) fn reject_newline_chars(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == b'\n' || b == b'\r') {
         return Err(Status::invalid_argument(format!(
             "{field_name} contains newline or carriage return characters"
@@ -203,14 +217,6 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         if size > MAX_TEMPLATE_STRUCT_SIZE {
             return Err(Status::invalid_argument(format!(
                 "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
-        }
-    }
-    if let Some(ref s) = tmpl.volume_claim_templates {
-        let size = s.encoded_len();
-        if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.volume_claim_templates serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
         }
     }
@@ -633,6 +639,22 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
         return Err(Status::invalid_argument(format!(
             "policy contains unsafe content: {}",
             messages.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that user-authored policy does not use provider-derived rule keys.
+pub(super) fn validate_no_reserved_provider_policy_keys(
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    if let Some(key) = policy
+        .network_policies
+        .keys()
+        .find(|key| openshell_policy::is_provider_rule_name(key))
+    {
+        return Err(Status::invalid_argument(format!(
+            "network_policies key '{key}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
         )));
     }
     Ok(())
@@ -1605,6 +1627,43 @@ mod tests {
         assert!(err.message().contains("TLD wildcard"));
     }
 
+    #[test]
+    fn validate_no_reserved_provider_policy_keys_rejects_reserved_key() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "_provider_work_github".into(),
+            NetworkPolicyRule {
+                name: "_provider_work_github".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = validate_no_reserved_provider_policy_keys(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
+        assert!(err.message().contains("policy get <sandbox> --base"));
+        assert!(err.message().contains("round-trippable base policy"));
+    }
+
+    #[test]
+    fn validate_no_reserved_provider_policy_keys_accepts_user_key() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "provider_work_github".into(),
+            NetworkPolicyRule {
+                name: "provider_work_github".into(),
+                ..Default::default()
+            },
+        );
+
+        assert!(validate_no_reserved_provider_policy_keys(&policy).is_ok());
+    }
+
     // ---- Static field validation ----
 
     #[test]
@@ -1754,5 +1813,55 @@ mod tests {
     fn reject_control_chars_rejects_newlines() {
         assert!(reject_control_chars("line1\nline2", "test").is_err());
         assert!(reject_control_chars("line1\rline2", "test").is_err());
+    }
+
+    #[test]
+    fn validate_exec_allows_newlines_in_command_args() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "def f():\n    return 1\nprint(f())".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_null_bytes_in_command_args() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["echo".to_string(), "hello\x00world".to_string()],
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("null"));
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_newlines_in_workdir() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            workdir: "/tmp\nmalicious".to_string(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("newline"));
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_newlines_in_env_values() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("newline"));
     }
 }

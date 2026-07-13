@@ -29,7 +29,7 @@ OpenShell supports several local compute drivers. Package-managed gateways leave
 | Compute Driver | How It Is Configured | System Requirements |
 |---|---|---|
 | Podman | The gateway is configured to create rootless Podman containers through the Podman API socket. | Linux with Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. |
-| Docker | The gateway is configured to create containers through Docker Desktop or Docker Engine. | Docker Desktop or Docker Engine 28.04 or later on the gateway host. |
+| Docker | The gateway is configured to create containers through Docker Desktop or Docker Engine. | Docker Desktop or Docker Engine 28.0 or later on the gateway host. |
 | MicroVM | The gateway is configured to create VM-backed sandboxes. | Host virtualization support. MicroVM uses Hypervisor.framework on macOS, KVM on Linux, and QEMU for GPU-backed sandboxes on Linux. |
 
 For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers). For gateway and sandbox operations, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
@@ -80,7 +80,7 @@ sudo loginctl enable-linger $USER
 Install the OpenShell snap from the Snap Store:
 
 ```shell
-sudo snap install openshell --classic
+sudo snap install openshell
 ```
 
 The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
@@ -88,6 +88,11 @@ systemd service. The gateway listens on `https://127.0.0.1:17670` and
 stores its database at `$SNAP_COMMON/gateway.db` (typically
 `/var/snap/openshell/common/gateway.db`). Create `$SNAP_COMMON/gateway.toml`
 when you need to override gateway settings.
+
+The snap CLI stores per-user config, data, and state under `$SNAP_USER_COMMON`,
+typically `~/snap/openshell/common`. Gateway registrations live under
+`$SNAP_USER_COMMON/.config/openshell/gateways/` instead of
+`~/.config/openshell/gateways/`.
 
 ### Snap store installs
 
@@ -108,7 +113,7 @@ manually.
 When installing a locally built `.snap` file, no plugs are connected by default:
 
 ```shell
-sudo snap install ./openshell_*.snap --dangerous --classic
+sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:home
 sudo snap connect openshell:network
 sudo snap connect openshell:network-bind

@@ -46,8 +46,8 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
 };
 use super::validation::{
-    level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
-    validate_sandbox_spec,
+    level_matches, source_matches, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -162,6 +162,7 @@ async fn handle_create_sandbox_inner(
     // empty, then validate policy safety before persisting.
     if let Some(ref mut policy) = spec.policy {
         openshell_policy::ensure_sandbox_process_identity(policy);
+        validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
     }
 
@@ -1465,9 +1466,6 @@ fn shell_escape(value: &str) -> Result<String, String> {
     if value.bytes().any(|b| b == 0) {
         return Err("value contains null bytes".to_string());
     }
-    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
-        return Err("value contains newline or carriage return".to_string());
-    }
     if value.is_empty() {
         return Ok("''".to_string());
     }
@@ -1483,6 +1481,36 @@ fn shell_escape(value: &str) -> Result<String, String> {
 
 /// Maximum total length of the assembled shell command string.
 const MAX_COMMAND_STRING_LEN: usize = 256 * 1024; // 256 KiB
+
+/// SSH keepalive for silent exec relays; stdout idle is not a timeout signal.
+const EXEC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Allow this many missed keepalive responses before russh fails the relay.
+const EXEC_KEEPALIVE_MAX: usize = 4;
+
+/// Max wait for a trailing `Close` after `ExitStatus`.
+const EXEC_POST_EXIT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// russh client config for exec relays.
+fn exec_ssh_client_config() -> russh::client::Config {
+    russh::client::Config {
+        keepalive_interval: Some(EXEC_KEEPALIVE_INTERVAL),
+        keepalive_max: EXEC_KEEPALIVE_MAX,
+        ..Default::default()
+    }
+}
+
+/// Treat channel EOF before an exit status as relay failure, not exit code 1.
+fn exec_loop_result(exit_code: Option<i32>) -> Result<i32, Status> {
+    exit_code.map_or_else(
+        || {
+            Err(Status::unavailable(
+                "exec relay closed before the command reported an exit status",
+            ))
+        },
+        Ok,
+    )
+}
 
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
     let mut parts = Vec::new();
@@ -1524,7 +1552,11 @@ async fn stream_exec_over_relay(
     timeout_seconds: u32,
     request_tty: bool,
 ) -> Result<(), Status> {
-    let command_preview: String = command.chars().take(120).collect();
+    let command_preview: String = command
+        .chars()
+        .take(120)
+        .flat_map(char::escape_default)
+        .collect();
     info!(
         sandbox_id = %sandbox_id,
         channel_id = %channel_id,
@@ -1600,7 +1632,11 @@ async fn stream_interactive_exec_over_relay(
     cols: u32,
     rows: u32,
 ) -> Result<(), Status> {
-    let command_preview: String = command.chars().take(120).collect();
+    let command_preview: String = command
+        .chars()
+        .take(120)
+        .flat_map(char::escape_default)
+        .collect();
     info!(
         sandbox_id = %sandbox_id,
         channel_id = %channel_id,
@@ -1690,7 +1726,7 @@ async fn run_interactive_exec_with_russh(
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
-    let config = Arc::new(russh::client::Config::default());
+    let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
@@ -1746,7 +1782,19 @@ async fn run_interactive_exec_with_russh(
     });
 
     let mut exit_code: Option<i32> = None;
-    while let Some(msg) = read_half.wait().await {
+    loop {
+        // Bound the post-ExitStatus wait against a lost Close.
+        let msg = if exit_code.is_some() {
+            match tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, read_half.wait()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) | Err(_) => break,
+            }
+        } else {
+            match read_half.wait().await {
+                Some(msg) => msg,
+                None => break,
+            }
+        };
         match msg {
             ChannelMsg::Data { data } => {
                 let event = Ok(ExecSandboxEvent {
@@ -1787,7 +1835,7 @@ async fn run_interactive_exec_with_russh(
         .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
         .await;
 
-    Ok(exit_code.unwrap_or(1))
+    exec_loop_result(exit_code)
 }
 
 /// Create a localhost SSH proxy that bridges to a relay `DuplexStream`.
@@ -1849,7 +1897,7 @@ async fn run_exec_with_russh(
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
-    let config = Arc::new(russh::client::Config::default());
+    let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
@@ -1897,7 +1945,19 @@ async fn run_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to close ssh stdin: {e}")))?;
 
     let mut exit_code: Option<i32> = None;
-    while let Some(msg) = channel.wait().await {
+    loop {
+        // Bound the post-ExitStatus wait against a lost Close.
+        let msg = if exit_code.is_some() {
+            match tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, channel.wait()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) | Err(_) => break,
+            }
+        } else {
+            match channel.wait().await {
+                Some(msg) => msg,
+                None => break,
+            }
+        };
         match msg {
             ChannelMsg::Data { data } => {
                 let _ = tx
@@ -1935,7 +1995,7 @@ async fn run_exec_with_russh(
         .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
         .await;
 
-    Ok(exit_code.unwrap_or(1))
+    exec_loop_result(exit_code)
 }
 
 // ---------------------------------------------------------------------------
@@ -2006,10 +2066,20 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_rejects_newlines() {
-        assert!(shell_escape("line1\nline2").is_err());
-        assert!(shell_escape("line1\rline2").is_err());
-        assert!(shell_escape("line1\r\nline2").is_err());
+    fn shell_escape_allows_newlines() {
+        assert!(shell_escape("line1\nline2").is_ok());
+        assert!(shell_escape("line1\rline2").is_ok());
+        assert!(shell_escape("line1\r\nline2").is_ok());
+    }
+
+    #[test]
+    fn shell_escape_preserves_newlines_in_single_quotes() {
+        assert_eq!(shell_escape("line1\nline2").unwrap(), "'line1\nline2'");
+        assert_eq!(
+            shell_escape("def f():\n    return 1").unwrap(),
+            "'def f():\n    return 1'"
+        );
+        assert_eq!(shell_escape("line1\r\nline2").unwrap(), "'line1\r\nline2'");
     }
 
     // ---- build_remote_exec_command ----
@@ -2065,7 +2135,45 @@ mod tests {
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
         };
-        assert!(build_remote_exec_command(&req).is_err());
+        // Validation layer rejects newlines in workdir
+        assert!(validate_exec_request_fields(&req).is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_accepts_multiline_script() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "def f():\n    return 1\nprint(f())".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("python3 -c "));
+        assert!(cmd.contains("'def f():\n    return 1\nprint(f())'"));
+    }
+
+    #[test]
+    fn build_remote_exec_command_multiline_with_single_quotes() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print('one')\r\nprint('two')".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("python3 -c "));
+        assert!(
+            cmd.contains("'print('\"'\"'one'\"'\"')\r\nprint('\"'\"'two'\"'\"')'"),
+            "CR/LF with embedded single quotes must compose correctly: {cmd}"
+        );
     }
 
     #[test]
@@ -2594,6 +2702,37 @@ mod tests {
         assert!(err.message().contains("TOKEN"));
         assert!(err.message().contains("provider-a"));
         assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_reserved_provider_policy_key() {
+        let state = test_server_state().await;
+        let mut policy = openshell_core::proto::SandboxPolicy::default();
+        policy.network_policies.insert(
+            "_provider_work_github".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let err = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "reserved-policy-key".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
     }
 
     #[tokio::test]

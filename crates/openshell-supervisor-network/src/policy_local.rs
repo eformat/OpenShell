@@ -1088,6 +1088,7 @@ fn network_endpoint_from_json(
                 operation_type: String::new(),
                 operation_name: String::new(),
                 fields: Vec::new(),
+                params: HashMap::new(),
             }),
         })
         .collect();
@@ -1102,6 +1103,7 @@ fn network_endpoint_from_json(
             operation_type: String::new(),
             operation_name: String::new(),
             fields: Vec::new(),
+            params: HashMap::new(),
         })
         .collect();
 
@@ -1125,7 +1127,12 @@ fn network_endpoint_from_json(
         persisted_queries: String::new(),
         graphql_persisted_queries: HashMap::new(),
         graphql_max_body_bytes: 0,
+        json_rpc_max_body_bytes: 0,
+        mcp: None,
         path: String::new(),
+        credential_signing: String::new(),
+        signing_service: String::new(),
+        signing_region: String::new(),
     })
 }
 

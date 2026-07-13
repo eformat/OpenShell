@@ -63,6 +63,7 @@ use openshell_providers::{
     profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use owo_colors::OwoColorize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,8 +78,29 @@ pub use crate::ssh::{
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{
-    find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
+    ForwardSpec, find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyGetView {
+    Metadata,
+    Base,
+    Full,
+}
+
+impl PolicyGetView {
+    pub fn from_flags(base: bool, full: bool) -> Self {
+        match (base, full) {
+            (true, _) => Self::Base,
+            (false, true) => Self::Full,
+            (false, false) => Self::Metadata,
+        }
+    }
+
+    fn includes_policy(self) -> bool {
+        matches!(self, Self::Base | Self::Full)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum SandboxUploadPlan {
@@ -1574,10 +1596,7 @@ pub fn doctor_check() -> Result<()> {
     Err(miette::miette!("docker info failed: {}", stderr.trim()))
 }
 
-fn sandbox_should_persist(
-    keep: bool,
-    forward: Option<&openshell_core::forward::ForwardSpec>,
-) -> bool {
+fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
     keep || forward.is_some()
 }
 
@@ -1745,31 +1764,86 @@ async fn finalize_sandbox_create_session(
     session_result
 }
 
+/// Configuration for creating a sandbox via the CLI.
+///
+/// Infrastructure parameters (`server`, `gateway_name`, `tls`) remain positional
+/// on the function signature, following the `provider_refresh_config(server, input, tls)`
+/// precedent. This struct captures sandbox-specific options.
+#[derive(Debug)]
+pub struct SandboxCreateConfig<'a> {
+    pub name: Option<&'a str>,
+    pub from: Option<&'a str>,
+    pub uploads: &'a [(String, Option<String>, bool)],
+    pub keep: bool,
+    pub gpu_requirements: Option<GpuResourceRequirements>,
+    pub cpu: Option<&'a str>,
+    pub memory: Option<&'a str>,
+    pub driver_config_json: Option<&'a str>,
+    pub editor: Option<Editor>,
+    pub providers: &'a [String],
+    pub policy: Option<&'a str>,
+    pub forward: Option<ForwardSpec>,
+    pub command: &'a [String],
+    pub tty_override: Option<bool>,
+    pub auto_providers_override: Option<bool>,
+    pub labels: HashMap<String, String>,
+    pub environment: HashMap<String, String>,
+    pub approval_mode: &'a str,
+}
+
+impl Default for SandboxCreateConfig<'_> {
+    fn default() -> Self {
+        Self {
+            name: None,
+            from: None,
+            uploads: &[],
+            keep: false,
+            gpu_requirements: None,
+            cpu: None,
+            memory: None,
+            driver_config_json: None,
+            editor: None,
+            providers: &[],
+            policy: None,
+            forward: None,
+            command: &[],
+            tty_override: None,
+            auto_providers_override: None,
+            labels: HashMap::new(),
+            environment: HashMap::new(),
+            approval_mode: "manual",
+        }
+    }
+}
+
 /// Create a sandbox with default settings.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)] // user-facing CLI command; default hasher is fine
 pub async fn sandbox_create(
     server: &str,
-    name: Option<&str>,
-    from: Option<&str>,
     gateway_name: &str,
-    uploads: &[(String, Option<String>, bool)],
-    keep: bool,
-    gpu_requirements: Option<GpuResourceRequirements>,
-    cpu: Option<&str>,
-    memory: Option<&str>,
-    driver_config_json: Option<&str>,
-    editor: Option<Editor>,
-    providers: &[String],
-    policy: Option<&str>,
-    forward: Option<openshell_core::forward::ForwardSpec>,
-    command: &[String],
-    tty_override: Option<bool>,
-    auto_providers_override: Option<bool>,
-    labels: &HashMap<String, String>,
-    environment: &HashMap<String, String>,
-    approval_mode: &str,
+    config: SandboxCreateConfig<'_>,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let SandboxCreateConfig {
+        name,
+        from,
+        uploads,
+        keep,
+        gpu_requirements,
+        cpu,
+        memory,
+        driver_config_json,
+        editor,
+        providers,
+        policy,
+        forward,
+        command,
+        tty_override,
+        auto_providers_override,
+        labels,
+        environment,
+        approval_mode,
+    } = config;
+
     if editor.is_some() && !command.is_empty() {
         return Err(miette::miette!(
             "--editor cannot be used with a trailing command; use `openshell sandbox connect <name> --editor ...` after the sandbox is ready"
@@ -1846,14 +1920,14 @@ pub async fn sandbox_create(
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
-            environment: environment.clone(),
+            environment,
             policy,
             providers: configured_providers,
             template,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
-        labels: labels.clone(),
+        labels,
     };
 
     let response = match client.create_sandbox(request).await {
@@ -3933,6 +4007,47 @@ pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Resolve `--secret-material-env KEY[=ENVVAR]` values from the CLI process
+/// environment (`ENVVAR` defaults to `KEY`) so secrets never transit argv.
+pub fn parse_secret_material_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let (key, env_name) = match item.split_once('=') {
+            Some((key, env_name)) => (key.trim(), env_name.trim()),
+            None => (item.trim(), item.trim()),
+        };
+        if key.is_empty() {
+            return Err(miette::miette!("--secret-material-env key cannot be empty"));
+        }
+        if env_name.is_empty() {
+            return Err(miette::miette!(
+                "--secret-material-env {key} names an empty environment variable"
+            ));
+        }
+
+        let value = std::env::var(env_name).map_err(|_| {
+            miette::miette!(
+                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
+            )
+        })?;
+        if value.trim().is_empty() {
+            return Err(miette::miette!(
+                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
+            ));
+        }
+
+        if map.contains_key(key) {
+            return Err(miette::miette!(
+                "--secret-material-env key '{key}' supplied more than once"
+            ));
+        }
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
 fn is_valid_env_name(key: &str) -> bool {
     let mut bytes = key.bytes();
     let Some(first) = bytes.next() else {
@@ -5208,6 +5323,7 @@ pub struct ProviderRefreshConfigInput<'a> {
     pub credential_key: &'a str,
     pub strategy: &'a str,
     pub material: &'a [String],
+    pub secret_material_env: &'a [String],
     pub secret_material_keys: &'a [String],
     pub credential_expires_at_ms: Option<i64>,
 }
@@ -5218,7 +5334,21 @@ pub async fn provider_refresh_config(
     tls: &TlsOptions,
 ) -> Result<()> {
     let strategy = provider_refresh_strategy(input.strategy)?;
-    let material = parse_key_value_pairs(input.material, "--material")?;
+    let mut material = parse_key_value_pairs(input.material, "--material")?;
+    let mut secret_material_keys = input.secret_material_keys.to_vec();
+    // Env-resolved secrets are auto-marked secret; duplicate keys are an
+    // error rather than a precedence order.
+    for (key, value) in parse_secret_material_env_pairs(input.secret_material_env)? {
+        if material.contains_key(&key) {
+            return Err(miette!(
+                "duplicate material key '{key}': supplied via both --material and --secret-material-env"
+            ));
+        }
+        if !secret_material_keys.contains(&key) {
+            secret_material_keys.push(key.clone());
+        }
+        material.insert(key, value);
+    }
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
@@ -5226,7 +5356,7 @@ pub async fn provider_refresh_config(
             credential_key: input.credential_key.to_string(),
             strategy: strategy as i32,
             material,
-            secret_material_keys: input.secret_material_keys.to_vec(),
+            secret_material_keys,
             expires_at_ms: input.credential_expires_at_ms,
         })
         .await
@@ -6867,7 +6997,7 @@ pub async fn sandbox_policy_get(
     server: &str,
     name: &str,
     version: u32,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -6877,7 +7007,7 @@ pub async fn sandbox_policy_get(
         server,
         name,
         version,
-        full,
+        view,
         output,
         tls,
         (&mut stdout, &mut stderr),
@@ -6901,7 +7031,7 @@ pub async fn sandbox_policy_get_to_writer<W, E>(
     server: &str,
     name: &str,
     version: u32,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
     writers: (&mut W, &mut E),
@@ -6911,7 +7041,7 @@ where
     E: Write + Send,
 {
     if version == 0 {
-        return sandbox_policy_get_effective_to_writer(server, name, full, output, tls, writers)
+        return sandbox_policy_get_effective_to_writer(server, name, view, output, tls, writers)
             .await;
     }
 
@@ -6938,7 +7068,7 @@ where
                     Some(inner.active_version),
                     &rev,
                     status,
-                    full,
+                    view,
                 )?;
                 writeln!(
                     stdout,
@@ -6966,10 +7096,11 @@ where
             writeln!(stdout, "Error:        {}", rev.load_error).into_diagnostic()?;
         }
 
-        if full {
+        if view.includes_policy() {
             if let Some(ref policy) = rev.policy {
                 writeln!(stdout, "---").into_diagnostic()?;
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                let policy = policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
@@ -6987,7 +7118,7 @@ where
 async fn sandbox_policy_get_effective_to_writer<W, E>(
     server: &str,
     name: &str,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
     writers: (&mut W, &mut E),
@@ -7060,10 +7191,11 @@ where
                     serde_json::json!(config.global_policy_version),
                 );
             }
-            if full {
+            if view.includes_policy() {
+                let policy = policy_for_view(policy, view);
                 obj.insert(
                     "policy".to_string(),
-                    openshell_policy::sandbox_policy_to_json_value(policy)?,
+                    openshell_policy::sandbox_policy_to_json_value(policy.as_ref())?,
                 );
             }
             writeln!(
@@ -7083,9 +7215,10 @@ where
                 writeln!(stdout, "Global:       {}", config.global_policy_version)
                     .into_diagnostic()?;
             }
-            if full {
+            if view.includes_policy() {
                 writeln!(stdout, "---").into_diagnostic()?;
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                let policy = policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             }
@@ -7099,7 +7232,7 @@ where
 pub async fn sandbox_policy_get_global(
     server: &str,
     version: u32,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -7119,7 +7252,7 @@ pub async fn sandbox_policy_get_global(
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
         match output {
             "json" => {
-                let obj = policy_revision_to_json("global", None, None, &rev, status, full)?;
+                let obj = policy_revision_to_json("global", None, None, &rev, status, view)?;
                 println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
                 return Ok(());
             }
@@ -7138,10 +7271,11 @@ pub async fn sandbox_policy_get_global(
             println!("Loaded:       {} ms", rev.loaded_at_ms);
         }
 
-        if full {
+        if view.includes_policy() {
             if let Some(ref policy) = rev.policy {
                 println!("---");
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                let policy = policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 print!("{yaml_str}");
             } else {
@@ -7171,7 +7305,7 @@ fn policy_revision_to_json(
     active_version: Option<u32>,
     rev: &openshell_core::proto::SandboxPolicyRevision,
     status: PolicyStatus,
-    full: bool,
+    view: PolicyGetView,
 ) -> Result<serde_json::Value> {
     let mut obj = serde_json::Map::new();
     obj.insert("scope".to_string(), serde_json::json!(scope));
@@ -7205,14 +7339,29 @@ fn policy_revision_to_json(
     if !rev.load_error.is_empty() {
         obj.insert("load_error".to_string(), serde_json::json!(rev.load_error));
     }
-    if full {
+    if view.includes_policy() {
         let policy = match rev.policy.as_ref() {
-            Some(policy) => openshell_policy::sandbox_policy_to_json_value(policy)?,
+            Some(policy) => {
+                let policy = policy_for_view(policy, view);
+                openshell_policy::sandbox_policy_to_json_value(policy.as_ref())?
+            }
             None => serde_json::Value::Null,
         };
         obj.insert("policy".to_string(), policy);
     }
     Ok(serde_json::Value::Object(obj))
+}
+
+fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, SandboxPolicy> {
+    if view != PolicyGetView::Base {
+        return Cow::Borrowed(policy);
+    }
+
+    let mut base_policy = policy.clone();
+    base_policy
+        .network_policies
+        .retain(|name, _| !openshell_policy::is_provider_rule_name(name));
+    Cow::Owned(base_policy)
 }
 
 pub async fn sandbox_policy_list(
@@ -7752,11 +7901,12 @@ mod tests {
         gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
-        progress_step_from_metadata, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
+        plaintext_gateway_is_remote, progress_step_from_metadata,
+        provider_profile_allows_empty_credentials, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7898,6 +8048,73 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_reads_value_from_named_environment_variable() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_NAMED", "pem-material");
+
+        let parsed =
+            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_NAMED".to_string()])
+                .expect("parse");
+        assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_defaults_env_name_to_key() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_KEY_ONLY", "key-only-material");
+
+        let parsed = parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
+            .expect("parse");
+        assert_eq!(
+            parsed.get("NAV_PARSE_SME_KEY_ONLY"),
+            Some(&"key-only-material".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_missing_environment() {
+        let _guard = EnvVarGuard::unset("NAV_PARSE_SME_MISSING");
+
+        let err =
+            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
+                .expect_err("missing env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_empty_environment_value() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_EMPTY", "   ");
+
+        let err = parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_EMPTY".to_string()])
+            .expect_err("blank env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_empty_key() {
+        let err = parse_secret_material_env_pairs(&["=NAV_PARSE_SME_NO_KEY".to_string()])
+            .expect_err("empty key should error");
+        assert!(err.to_string().contains("key cannot be empty"));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
+
+        let err = parse_secret_material_env_pairs(&[
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+        ])
+        .expect_err("duplicate key should error");
+        assert!(
+            err.to_string()
+                .contains("key 'private_key' supplied more than once")
+        );
     }
 
     #[test]
@@ -8097,16 +8314,15 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_parses_bool_aliases() {
-        let yes_value = parse_cli_setting_value("dummy_bool", "yes").expect("parse yes");
+        let yes_value = parse_cli_setting_value("ocsf_json_enabled", "yes").expect("parse yes");
         assert_eq!(
             yes_value.value,
             Some(openshell_core::proto::setting_value::Value::BoolValue(true))
         );
 
-        let zero_value = parse_cli_setting_value("dummy_bool", "0").expect("parse 0");
+        let zero_value = parse_cli_setting_value("ocsf_json_enabled", "0").expect("parse 0");
         assert_eq!(
             zero_value.value,
             Some(openshell_core::proto::setting_value::Value::BoolValue(
@@ -8115,21 +8331,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dev-settings")]
-    #[test]
-    fn parse_cli_setting_value_parses_int_key() {
-        let int_value = parse_cli_setting_value("dummy_int", "42").expect("parse int");
-        assert_eq!(
-            int_value.value,
-            Some(openshell_core::proto::setting_value::Value::IntValue(42))
-        );
-    }
-
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_rejects_invalid_bool() {
-        let err =
-            parse_cli_setting_value("dummy_bool", "maybe").expect_err("invalid bool should fail");
+        let err = parse_cli_setting_value("ocsf_json_enabled", "maybe")
+            .expect_err("invalid bool should fail");
         assert!(err.to_string().contains("invalid bool value"));
     }
 

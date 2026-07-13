@@ -3,10 +3,13 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
+pub mod driver_config;
 pub mod lease;
 pub mod vm;
 
 pub use openshell_driver_docker::DockerComputeConfig;
+pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -16,6 +19,7 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
@@ -32,20 +36,22 @@ use openshell_core::proto::{
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
-    ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
+    ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
-use openshell_driver_podman::{
-    ComputeDriverService as PodmanDriverService, PodmanComputeConfig, PodmanComputeDriver,
-};
+use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::{Mutex, watch};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
+use tower::service_fn;
 use tracing::{debug, info, warn};
 
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
@@ -105,11 +111,11 @@ pub use openshell_core::ComputeDriverError as ComputeError;
 #[derive(Debug)]
 pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
-    socket_path: std::path::PathBuf,
+    socket_path: PathBuf,
 }
 
 impl ManagedDriverProcess {
-    pub(crate) fn new(child: tokio::process::Child, socket_path: std::path::PathBuf) -> Self {
+    pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
@@ -123,6 +129,35 @@ impl Drop for ManagedDriverProcess {
             let _ = child.take();
         }
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[derive(Debug)]
+pub struct AcquiredRemoteDriverEndpoint {
+    pub(crate) name: String,
+    pub(crate) channel: Channel,
+    pub(crate) driver_process: Option<Arc<ManagedDriverProcess>>,
+}
+
+impl AcquiredRemoteDriverEndpoint {
+    pub(crate) fn managed_builtin(
+        driver_kind: ComputeDriverKind,
+        channel: Channel,
+        driver_process: Arc<ManagedDriverProcess>,
+    ) -> Self {
+        Self {
+            name: driver_kind.as_str().to_string(),
+            channel,
+            driver_process: Some(driver_process),
+        }
+    }
+
+    pub(crate) fn unmanaged(name: impl Into<String>, channel: Channel) -> Self {
+        Self {
+            name: name.into(),
+            channel,
+            driver_process: None,
+        }
     }
 }
 
@@ -224,7 +259,7 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: String,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -248,7 +283,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
-        driver_kind: ComputeDriverKind,
+        driver_name: String,
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
@@ -258,18 +293,24 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        _allows_loopback_endpoints: bool,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
-        let default_image = driver
+        let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
             .await
             .map_err(compute_error_from_status)?
-            .into_inner()
-            .default_image;
+            .into_inner();
+        let driver_kind = driver_name.parse::<ComputeDriverKind>().ok();
+        info!(
+            configured_driver = %driver_name,
+            advertised_driver = %capabilities.driver_name,
+            in_tree = driver_kind.is_some(),
+            "Compute driver connected"
+        );
+        let default_image = capabilities.default_image;
         Ok(Self {
             driver,
-            driver_kind: Some(driver_kind),
+            driver_name,
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -314,7 +355,7 @@ impl ComputeRuntime {
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
-            ComputeDriverKind::Docker,
+            ComputeDriverKind::Docker.as_str().to_string(),
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
@@ -324,7 +365,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             gateway_bind_addresses,
         )
         .await
@@ -341,9 +381,9 @@ impl ComputeRuntime {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
+        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
             None,
             None,
@@ -353,34 +393,31 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            false,
             Vec::new(),
         )
         .await
     }
 
-    pub(crate) async fn new_remote_vm(
-        channel: Channel,
-        driver_process: Option<Arc<ManagedDriverProcess>>,
+    pub(crate) async fn new_remote_driver(
+        endpoint: AcquiredRemoteDriverEndpoint,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
+        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
         Self::from_driver(
-            ComputeDriverKind::Vm,
+            endpoint.name,
             driver,
             None,
             None,
-            driver_process,
+            endpoint.driver_process,
             store,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
@@ -399,7 +436,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Podman,
+            ComputeDriverKind::Podman.as_str().to_string(),
             driver,
             None,
             None,
@@ -409,7 +446,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
@@ -422,7 +458,7 @@ impl ComputeRuntime {
 
     #[must_use]
     pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
-        self.driver_kind
+        self.driver_name.parse().ok()
     }
 
     #[must_use]
@@ -432,7 +468,7 @@ impl ComputeRuntime {
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
         let driver_sandbox =
-            driver_sandbox_from_public(sandbox, self.driver_kind).map_err(|status| *status)?;
+            driver_sandbox_from_public(sandbox, &self.driver_name).map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -448,7 +484,7 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox =
-            driver_sandbox_from_public(&sandbox, self.driver_kind).map_err(|status| *status)?;
+            driver_sandbox_from_public(&sandbox, &self.driver_name).map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -1472,9 +1508,48 @@ impl ComputeRuntime {
     }
 }
 
+/// Connect to an unmanaged remote compute driver that is already listening on
+/// `socket_path` and return the acquired endpoint.
+///
+/// The gateway does not spawn or own the driver process — the operator is
+/// responsible for placing the driver alongside the gateway and granting the
+/// gateway uid read/write on the socket. The host portion of the URL is
+/// ignored because the connector resolves to the UDS rather than DNS.
+#[cfg(unix)]
+pub async fn connect_remote_compute_driver(
+    name: impl Into<String>,
+    socket_path: &Path,
+) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
+    let socket_path: PathBuf = socket_path.to_path_buf();
+    let display_path = socket_path.clone();
+    let channel = Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+            let socket_path = socket_path.clone();
+            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
+        }))
+        .await
+        .map_err(|e| {
+            ComputeError::Message(format!(
+                "failed to connect to remote compute driver socket '{}': {e}",
+                display_path.display()
+            ))
+        })?;
+    Ok(AcquiredRemoteDriverEndpoint::unmanaged(name, channel))
+}
+
+#[cfg(not(unix))]
+pub async fn connect_remote_compute_driver(
+    _name: impl Into<String>,
+    _socket_path: &Path,
+) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
+    Err(ComputeError::Message(
+        "remote compute driver endpoints require unix domain socket support".to_string(),
+    ))
+}
+
 fn driver_sandbox_from_public(
     sandbox: &Sandbox,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<DriverSandbox, Box<Status>> {
     Ok(DriverSandbox {
         id: sandbox.object_id().to_string(),
@@ -1483,7 +1558,7 @@ fn driver_sandbox_from_public(
         spec: sandbox
             .spec
             .as_ref()
-            .map(|spec| driver_sandbox_spec_from_public(spec, driver_kind))
+            .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
             .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
     })
@@ -1491,7 +1566,7 @@ fn driver_sandbox_from_public(
 
 fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
     Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
@@ -1499,7 +1574,7 @@ fn driver_sandbox_spec_from_public(
         template: spec
             .template
             .as_ref()
-            .map(|template| driver_sandbox_template_from_public(template, driver_kind))
+            .map(|template| driver_sandbox_template_from_public(template, driver_name))
             .transpose()?,
         resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
             DriverSandboxResourceRequirements {
@@ -1515,7 +1590,7 @@ fn driver_sandbox_spec_from_public(
 
 fn driver_sandbox_template_from_public(
     template: &SandboxTemplate,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<DriverSandboxTemplate, Box<Status>> {
     Ok(DriverSandboxTemplate {
         image: template.image.clone(),
@@ -1524,21 +1599,17 @@ fn driver_sandbox_template_from_public(
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
-        driver_config: select_driver_config(&template.driver_config, driver_kind)?,
+        driver_config: select_driver_config(&template.driver_config, driver_name)?,
     })
 }
 
 fn select_driver_config(
     config: &Option<prost_types::Struct>,
-    driver_kind: Option<ComputeDriverKind>,
+    driver_name: &str,
 ) -> Result<Option<prost_types::Struct>, Box<Status>> {
     let Some(config) = config else {
         return Ok(None);
     };
-    let Some(driver_kind) = driver_kind else {
-        return Ok(None);
-    };
-    let driver_name = driver_kind.as_str();
     let Some(value) = config.fields.get(driver_name) else {
         return Ok(None);
     };
@@ -1595,8 +1666,8 @@ fn extract_typed_resources(
 }
 
 /// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (`runtime_class_name`, annotations, `volume_claim_templates`)
-/// plus any resource fields beyond CPU/memory.
+/// template fields (`runtime_class_name`, annotations) plus any resource fields
+/// beyond CPU/memory.
 fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
     use prost_types::{Struct, Value, value::Kind};
 
@@ -1630,16 +1701,6 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
                 kind: Some(Kind::StructValue(Struct {
                     fields: annotation_fields,
                 })),
-            },
-        );
-    }
-
-    // Pass through the raw volume_claim_templates Struct as a nested value.
-    if let Some(ref vct) = template.volume_claim_templates {
-        fields.insert(
-            "volume_claim_templates".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(vct.clone())),
             },
         );
     }
@@ -2035,7 +2096,7 @@ impl ComputeDriver for NoopTestDriver {
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
-        driver_kind: None,
+        driver_name: "test".to_string(),
         shutdown_cleanup: None,
         startup_resume: None,
         _driver_process: None,
@@ -2097,8 +2158,8 @@ mod tests {
             ..Default::default()
         };
 
-        let driver =
-            driver_sandbox_spec_from_public(&public, None).expect("driver spec should map");
+        let driver = driver_sandbox_spec_from_public(&public, "test-driver")
+            .expect("driver spec should map");
 
         let gpu = driver
             .resource_requirements
@@ -2125,8 +2186,7 @@ mod tests {
             .collect(),
         };
 
-        let selected =
-            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+        let selected = select_driver_config(&Some(config), "kubernetes").unwrap();
         let selected = selected.expect("kubernetes config should be selected");
 
         assert!(selected.fields.contains_key("node"));
@@ -2143,10 +2203,25 @@ mod tests {
             .collect(),
         };
 
-        let selected =
-            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+        let selected = select_driver_config(&Some(config), "kubernetes").unwrap();
 
         assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_driver_config_forwards_named_remote_driver_block() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "kyma".to_string(),
+                struct_value([("pool", string_value("gpu"))]),
+            ))
+            .collect(),
+        };
+
+        let selected = select_driver_config(&Some(config), "kyma").unwrap();
+        let selected = selected.expect("named remote config should be selected");
+
+        assert!(selected.fields.contains_key("pool"));
     }
 
     #[test]
@@ -2156,8 +2231,7 @@ mod tests {
                 .collect(),
         };
 
-        let err =
-            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap_err();
+        let err = select_driver_config(&Some(config), "kubernetes").unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("template.driver_config.kubernetes"));
@@ -2277,7 +2351,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
-            driver_kind: None,
+            driver_name: "test-driver".to_string(),
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -3361,6 +3435,103 @@ mod tests {
             config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
             "unset user_namespaces must not produce host_users"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_forwards_lifecycle_calls_over_uds() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new()
+            .with_driver_name("fake-remote-driver")
+            .with_default_image("openshell/sandbox:remote");
+        let _server = driver.serve_uds(&socket_path).unwrap();
+
+        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+            .await
+            .unwrap();
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let runtime = ComputeRuntime::new_remote_driver(
+            endpoint,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            log_level: "debug".to_string(),
+            template: Some(SandboxTemplate {
+                image: "ghcr.io/nvidia/openshell/sandbox:test".to_string(),
+                driver_config: Some(prost_types::Struct {
+                    fields: [
+                        (
+                            "external-test".to_string(),
+                            struct_value([("pool", string_value("ci"))]),
+                        ),
+                        (
+                            "docker".to_string(),
+                            struct_value([("network_mode", string_value("bridge"))]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        runtime.validate_sandbox_create(&sandbox).await.unwrap();
+        runtime.create_sandbox(sandbox, None).await.unwrap();
+        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap());
+
+        let calls = driver.calls();
+        assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
+        assert!(matches!(calls[0], FakeComputeDriverCall::GetCapabilities));
+
+        let validated = match &calls[1] {
+            FakeComputeDriverCall::ValidateSandboxCreate {
+                sandbox: Some(sandbox),
+            } => sandbox,
+            other => panic!("expected ValidateSandboxCreate call, got {other:?}"),
+        };
+        assert_eq!(validated.id, "sb-uds");
+        assert_eq!(validated.name, "uds-sandbox");
+        let driver_config = validated
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .and_then(|template| template.driver_config.as_ref())
+            .expect("selected driver_config should be forwarded");
+        assert!(driver_config.fields.contains_key("pool"));
+        assert!(!driver_config.fields.contains_key("network_mode"));
+
+        let created = match &calls[2] {
+            FakeComputeDriverCall::CreateSandbox {
+                sandbox: Some(sandbox),
+            } => sandbox,
+            other => panic!("expected CreateSandbox call, got {other:?}"),
+        };
+        assert_eq!(created.id, "sb-uds");
+        assert_eq!(created.name, "uds-sandbox");
+
+        match &calls[3] {
+            FakeComputeDriverCall::DeleteSandbox {
+                sandbox_id,
+                sandbox_name,
+            } => {
+                assert_eq!(sandbox_id, "sb-uds");
+                assert_eq!(sandbox_name, "uds-sandbox");
+            }
+            other => panic!("expected DeleteSandbox call, got {other:?}"),
+        }
     }
 
     #[tokio::test]

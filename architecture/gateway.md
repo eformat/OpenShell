@@ -66,10 +66,13 @@ token through `IssueSandboxToken`. The gateway validates that projected token
 with Kubernetes `TokenReview`, requires the configured sandbox service account,
 checks the returned pod binding against the live pod UID, and verifies the pod's
 controlling `Sandbox` ownerReference against the live Sandbox CR UID and
-sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
-in memory before expiry only while the sandbox record still exists. Older tokens
-are not server-revoked; shared deployments bound replay exposure with short
-`gateway_jwt.ttl_secs` lifetimes. The config default is
+sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
+controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
+deployments. Supervisors renew gateway JWTs in memory before expiry only while
+the sandbox record still exists. Older tokens are not server-revoked; shared
+deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+The config default is
 `gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
 gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
 shared deployments should set a positive TTL.
@@ -364,6 +367,15 @@ sequenceDiagram
 The same relay pattern backs interactive SSH, command execution, file sync, and
 local service forwarding. The gateway tracks live sessions in memory and
 persists session records so tokens can expire or be revoked.
+
+Relay liveness has two backstops so a reset supervisor session cannot leave a
+request parked forever. The gateway runs server-side HTTP/2 keepalive on
+supervisor connections, and each exec relay's SSH client uses SSH keepalive: an
+exec channel may be legitimately silent for a long time (e.g. an agent whose
+stdout is redirected to a file), so the exec is never ended on output-idle
+alone — instead an unanswered keepalive on a wedged or orphaned relay closes the
+channel and returns the exec with an error. Once a command reports its exit
+status, the gateway also bounds how long it waits for the trailing channel close.
 
 `ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
 The first frame is a `TcpForwardInit` that carries the sandbox ID, an

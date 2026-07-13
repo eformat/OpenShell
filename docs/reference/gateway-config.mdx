@@ -88,7 +88,8 @@ disable_tls = false
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"
 host_gateway_ip         = "10.0.0.1"
@@ -172,11 +173,16 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
-supervisor_image               = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
+# "combined" runs the existing single supervisor container with full process,
+# filesystem, and network enforcement in the agent container. "sidecar" moves
+# pod-level network enforcement and gateway session handling into a network sidecar.
+topology                       = "combined"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
@@ -194,6 +200,24 @@ sa_token_ttl_secs              = 3600
 # shared roots such as /run, /var, /tmp, and /etc are rejected.
 # Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+# Explicit sandbox UID/GID for the supervisor container securityContext and
+# PVC init container. When unset, the driver auto-detects from OpenShift SCC
+# namespace annotations (openshift.io/sa.scc.uid-range) if present, falling
+# back to 1000 on non-OpenShift clusters.
+# sandbox_uid = 1500
+# sandbox_gid = 1500
+
+[openshell.drivers.kubernetes.sidecar]
+# UID used by relaxed long-running network sidecars. Strict process/binary-aware
+# sidecars run as UID 0 so Kubernetes grants the required /proc inspection
+# capabilities into the effective set. In sidecar topology the network init
+# container installs nftables rules that exempt the effective sidecar UID.
+proxy_uid                      = 1337
+# Keep process/binary-aware network policy enabled in sidecar topology. Set
+# false to run the sidecar as proxy_uid, drop the sidecar's extra /proc
+# inspection capabilities, and enforce endpoint/L7 policy without matching
+# policy.binaries.
+process_binary_aware_network_policy = true
 ```
 
 ### Docker
@@ -218,7 +242,9 @@ sandbox_namespace  = "docker-dev"
 grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
-supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
+# When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
 guest_tls_key      = "/etc/openshell/certs/client-key.pem"
@@ -260,7 +286,8 @@ network_name            = "openshell"
 # host_gateway_ip       = "192.168.127.254"
 sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 10
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
@@ -305,4 +332,28 @@ overlay_disk_mib = 4096
 guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
 guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
+# Resolved sandbox UID/GID for the rootfs /etc/passwd entry.
+# Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
+# sandbox_uid = 20001
+```
+
+### Extension Driver
+
+Extension drivers run outside the gateway and expose the
+`compute_driver.proto` gRPC service on a Unix socket. Use a non-reserved driver
+name; built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot
+be selected through unmanaged socket endpoints. The selected driver name is the
+key used for driver-owned sandbox config such as `template.driver_config.<name>`.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_drivers = ["kyma"]
+
+[openshell.drivers.kyma]
+socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```

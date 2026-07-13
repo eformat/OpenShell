@@ -78,12 +78,29 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
+{{/* Official supervisor repository used by the gateway's built-in default. */}}
+{{- define "openshell.defaultSupervisorRepository" -}}
+ghcr.io/nvidia/openshell/supervisor
+{{- end }}
+
 {{/*
-Supervisor image reference. Same appVersion fallback as openshell.image so
-the supervisor and gateway images stay in sync across releases.
+Whether Helm must propagate a supervisor image override into gateway.toml.
+The chart's documented repository and empty tag are the gateway-owned default.
+*/}}
+{{- define "openshell.supervisorImageOverrideEnabled" -}}
+{{- $defaultRepository := include "openshell.defaultSupervisorRepository" . -}}
+{{- $repository := .Values.supervisor.image.repository | default $defaultRepository -}}
+{{- if or (ne $repository $defaultRepository) .Values.supervisor.image.tag -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Supervisor image override. A tag-only override uses the official repository;
+a repository-only override uses the effective gateway image tag.
 */}}
 {{- define "openshell.supervisorImage" -}}
-{{- printf "%s:%s" .Values.supervisor.image.repository (.Values.supervisor.image.tag | default .Chart.AppVersion) }}
+{{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
+{{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
 {{- end }}
 
 {{/*
@@ -142,6 +159,24 @@ init-container
 {{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Default server certificate DNS SANs derived from the release name and namespace.
+Returns a YAML list. Append extra SANs from values with range loops.
+*/}}
+{{- define "openshell.defaultServerDnsNames" -}}
+{{- $name := include "openshell.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- list $name
+      (printf "%s.%s.svc" $name $ns)
+      (printf "%s.%s.svc.cluster.local" $name $ns)
+      "localhost"
+      (printf "%s.localhost" $name)
+      (printf "*.%s.localhost" $name)
+      "host.docker.internal"
+      "host.containers.internal"
+  | toYaml }}
 {{- end }}
 
 {{/*

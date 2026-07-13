@@ -56,12 +56,15 @@ paths to sandbox requests. Image mounts are not part of the Docker
 driver-config schema. The driver still uses internal bind mounts for
 OpenShell-owned supervisor, token, and TLS material.
 
-Docker `bind` mounts accept `source`, `target`, and optional `read_only`.
-Docker `volume` mounts may include `subpath`. User-supplied bind and volume
-mounts are read-only by default; set `read_only: false` to make them writable.
-Mount targets must be absolute container paths and must not replace the
-workspace root (`/sandbox`) or overlap OpenShell supervisor files,
-`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
+Docker `bind` mounts accept `source`, `target`, optional `read_only`, and an
+optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
+`:Z`) for SELinux-enforcing hosts. Docker `volume` mounts may include
+`subpath`. User-supplied bind and volume mounts are read-only by default; set
+`read_only: false` to make them writable. Mount `source`, `target`, and
+`subpath` values must not contain surrounding whitespace. Mount targets must be
+absolute container paths and must not replace the workspace root (`/sandbox`)
+or overlap OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
+or `/run/netns`.
 
 Example named-volume usage:
 
@@ -79,10 +82,11 @@ The Docker driver bind-mounts a host-side Linux `openshell-sandbox` binary into
 each sandbox container. Resolution order is:
 
 1. `supervisor_bin` in `[openshell.drivers.docker]`.
-2. A sibling `openshell-sandbox` next to the running `openshell-gateway` binary.
-3. A local Linux cargo target build for the Docker daemon architecture.
-4. `supervisor_image` in `[openshell.drivers.docker]`, or the
-   release-matched default supervisor image, extracting `/openshell-sandbox`.
+2. `supervisor_image` in `[openshell.drivers.docker]`, extracting
+   `/openshell-sandbox` from that image.
+3. A sibling `openshell-sandbox` next to the running `openshell-gateway` binary.
+4. A local Linux cargo target build for the Docker daemon architecture.
+5. The release-matched default supervisor image, extracting `/openshell-sandbox`.
 
 Release and Docker-image gateway builds bake the matching supervisor image tag
 into the binary at compile time. The default Docker supervisor image is not

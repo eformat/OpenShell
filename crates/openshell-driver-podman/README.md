@@ -42,7 +42,7 @@ The container spec in `container.rs` sets these security-critical fields:
 |---|---|---|
 | `user` | `0:0` | The supervisor needs root inside the container for namespace creation, proxy setup, Landlock, seccomp, and filesystem preparation. |
 | `cap_drop` | Selected unneeded defaults | Podman's default capability set is already restricted. The driver drops capabilities the supervisor does not need. |
-| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH` | Grants supervisor-only capabilities required for namespace setup, process identity, and bypass diagnostics. |
+| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP` | Grants supervisor-only capabilities required for namespace setup, process identity, bypass diagnostics, and child bounding-set cleanup. |
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
@@ -68,16 +68,18 @@ mount types:
   pulls the image during provisioning using the sandbox image pull policy.
 
 Host bind mounts are disabled by default because they expose gateway host paths
-to sandbox requests. The driver still uses internal bind mounts for
-OpenShell-owned token and TLS material.
+to sandbox requests. The driver still uses internal bind mounts for configured
+TLS material; per-sandbox gateway JWTs are delivered through Podman secrets.
 
-Podman `bind` mounts accept `source`, `target`, and optional `read_only`.
-User-supplied bind and volume mounts are read-only by default; set
-`read_only: false` to make them writable. Podman image and volume mounts do not
-support `subpath` in OpenShell driver config. Mount targets must be absolute
-container paths and must not replace the workspace root (`/sandbox`) or overlap
-OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`, or
-`/run/netns`.
+Podman `bind` mounts accept `source`, `target`, optional `read_only`, and an
+optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
+`:Z`) for SELinux-enforcing hosts. User-supplied bind and volume mounts are
+read-only by default; set `read_only: false` to make them writable. Podman
+image and volume mounts do not support `subpath` in OpenShell driver config.
+Mount `source` and `target` values must not contain surrounding whitespace.
+Mount targets must be absolute container paths and must not replace
+the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
+`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
 
 Example named-volume usage:
 
@@ -98,12 +100,15 @@ openshell sandbox create \
 | `SYS_PTRACE` | Reading `/proc/<pid>/exe` and walking process ancestry for binary identity. |
 | `SYSLOG` | Reading `/dev/kmsg` for bypass-detection diagnostics. |
 | `DAC_READ_SEARCH` | Reading `/proc/<pid>/fd/` across UIDs so the proxy can resolve the binary responsible for a connection. |
+| `SETPCAP` | Clearing the restricted child process capability bounding set before exec. |
 
 The driver intentionally keeps Podman's default `SETUID`, `SETGID`, `CHOWN`,
 and `FOWNER` capabilities because the supervisor needs them to drop privileges
-and prepare writable sandbox directories. It drops unneeded defaults such as
+and prepare writable sandbox directories. It also keeps `SETPCAP` until child
+setup so `drop_privileges()` can clear the child capability bounding set before
+exec. It drops unneeded defaults such as
 `DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `NET_RAW`, `SETFCAP`,
-`SETPCAP`, and `SYS_CHROOT`.
+and `SYS_CHROOT`.
 
 ## Supervisor Sideloading
 
@@ -125,8 +130,8 @@ sequenceDiagram
     C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
 ```
 
-The supervisor image from `deploy/docker/Dockerfile.supervisor` copies the static
-`openshell-sandbox` binary to `/openshell-sandbox`.
+The supervisor image from `deploy/docker/Dockerfile.supervisor` provides the
+static `openshell-sandbox` binary at `/openshell-sandbox`.
 Mounting that image at `/opt/openshell/bin` makes the binary available as
 `/opt/openshell/bin/openshell-sandbox`.
 

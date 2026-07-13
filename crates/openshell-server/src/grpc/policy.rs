@@ -71,7 +71,8 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_policy_safety, validate_static_fields_unchanged,
+    level_matches, source_matches, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -1507,6 +1508,7 @@ async fn handle_update_config_inner(
                 Status::invalid_argument("policy is required for global policy update")
             })?;
             openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
+            validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
 
             let payload = new_policy.encode_to_vec();
@@ -1814,6 +1816,16 @@ async fn handle_update_config_inner(
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
     openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
+    if sandbox_caller {
+        if openshell_policy::strip_provider_rule_names(&mut new_policy) {
+            debug!(
+                sandbox_id = %sandbox_id,
+                "UpdateConfig: stripped provider-derived policy entries from sandbox sync"
+            );
+        }
+    } else {
+        validate_no_reserved_provider_policy_keys(&new_policy)?;
+    }
 
     if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
@@ -2270,7 +2282,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // own rule so the prover sees their contribution honestly. Reject at
         // the entry boundary — the agent never has reason to address a
         // provider rule by name.
-        if chunk.rule_name.starts_with("_provider_") {
+        if openshell_policy::is_provider_rule_name(&chunk.rule_name) {
             rejected += 1;
             rejection_reasons.push(format!(
                 "chunk '{}' uses reserved '_provider_' rule-name prefix",
@@ -3459,7 +3471,14 @@ fn parse_proto_add_allow_rules(
 fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
     for operation in operations {
         match operation {
-            PolicyMergeOp::AddRule { rule, .. } => validate_rule_not_always_blocked(rule)?,
+            PolicyMergeOp::AddRule { rule_name, rule } => {
+                if openshell_policy::is_provider_rule_name(rule_name) {
+                    return Err(Status::invalid_argument(format!(
+                        "merge operation add_rule rule_name '{rule_name}' uses reserved '_provider_' prefix for provider composition"
+                    )));
+                }
+                validate_rule_not_always_blocked(rule)?;
+            }
             PolicyMergeOp::AddAllowRules { host, .. } => validate_host_not_always_blocked(host)?,
             _ => {}
         }
@@ -3577,16 +3596,12 @@ pub(super) async fn merge_chunk_into_policy(
 ) -> Result<(i64, String), Status> {
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
-    apply_merge_operations_with_retry(
-        store,
-        sandbox_id,
-        None,
-        &[PolicyMergeOp::AddRule {
-            rule_name: chunk.rule_name.clone(),
-            rule,
-        }],
-    )
-    .await
+    let operations = [PolicyMergeOp::AddRule {
+        rule_name: chunk.rule_name.clone(),
+        rule,
+    }];
+    validate_merge_operations_for_server(&operations)?;
+    apply_merge_operations_with_retry(store, sandbox_id, None, &operations).await
 }
 
 async fn remove_chunk_from_policy(
@@ -4017,6 +4032,19 @@ mod tests {
             },
         }));
         assert!(!is_sandbox_caller(&req));
+    }
+
+    #[test]
+    fn merge_operation_validation_rejects_reserved_provider_add_rule_name() {
+        let err = validate_merge_operations_for_server(&[PolicyMergeOp::AddRule {
+            rule_name: "_provider_work_github".to_string(),
+            rule: NetworkPolicyRule::default(),
+        }])
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
     }
 
     // ---- Sandbox IDOR guard (issue #1354) ----
@@ -4938,7 +4966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_config_preserves_overlapping_user_and_provider_rules() {
+    async fn sandbox_config_composes_user_and_provider_rules() {
         let state = test_server_state().await;
         enable_providers_v2(&state).await;
         state
@@ -4951,7 +4979,7 @@ mod tests {
             .put_message(&test_sandbox(
                 "sb-overlap",
                 "overlap",
-                test_policy_with_rule("_provider_work_github", "api.github.com"),
+                test_policy_with_rule("custom_github", "api.github.com"),
                 vec!["work-github".to_string()],
             ))
             .await
@@ -4962,17 +4990,17 @@ mod tests {
         assert!(
             effective_policy
                 .network_policies
-                .contains_key("_provider_work_github")
+                .contains_key("custom_github")
         );
         assert!(
             effective_policy
                 .network_policies
-                .contains_key("_provider_work_github_2")
+                .contains_key("_provider_work_github")
         );
         assert_eq!(
             effective_policy
                 .network_policies
-                .get("_provider_work_github")
+                .get("custom_github")
                 .unwrap()
                 .endpoints[0]
                 .host,
@@ -7030,6 +7058,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn approve_draft_chunk_rejects_stored_reserved_provider_rule_name() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-approve-provider-prefix";
+        let sandbox_name = "approve-provider-prefix";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "_provider_work_github".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let chunk = DraftChunkRecord {
+            id: "chunk-provider-prefix".to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "_provider_work_github".to_string(),
+            proposed_rule: proposed_rule.encode_to_vec(),
+            rationale: "stored legacy/proposal chunk should not approve".to_string(),
+            security_notes: String::new(),
+            confidence: 1.0,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            host: "api.github.com".to_string(),
+            port: 443,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
+        };
+        state
+            .store
+            .put_draft_chunk(&chunk, None)
+            .await
+            .expect("draft chunk should persist");
+
+        let err = handle_approve_draft_chunk(
+            &state,
+            with_user(Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: chunk.id.clone(),
+            })),
+        )
+        .await
+        .expect_err("reserved provider rule names must be rejected at approval");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
+        let stored_chunk = state
+            .store
+            .get_draft_chunk(&chunk.id)
+            .await
+            .unwrap()
+            .expect("chunk should still exist");
+        assert_eq!(stored_chunk.status, "pending");
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed approval must not persist a policy revision"
+        );
+    }
+
     /// v1 calibration row: **L4 with a credential in scope → HIGH finding.**
     /// The sandbox has a github provider attached, so a credential is in
     /// scope for api.github.com. A broad L4 proposal therefore lands in
@@ -8212,6 +8328,7 @@ mod tests {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    params: HashMap::default(),
                 }),
             }],
         };
@@ -8607,6 +8724,7 @@ mod tests {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    params: HashMap::default(),
                 }),
             }],
         }];
@@ -8753,6 +8871,7 @@ mod tests {
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
+                    params: HashMap::default(),
                 }),
             }],
         };
@@ -8895,24 +9014,22 @@ mod tests {
         assert!(err.message().contains("unknown setting key"));
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn proto_setting_to_stored_rejects_type_mismatch() {
         let value = SettingValue {
             value: Some(setting_value::Value::StringValue("true".to_string())),
         };
-        let err = proto_setting_to_stored("dummy_bool", &value).unwrap_err();
+        let err = proto_setting_to_stored("ocsf_json_enabled", &value).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("expects bool value"));
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn proto_setting_to_stored_accepts_bool_for_registered_bool_key() {
         let value = SettingValue {
             value: Some(setting_value::Value::BoolValue(true)),
         };
-        let stored = proto_setting_to_stored("dummy_bool", &value).unwrap();
+        let stored = proto_setting_to_stored("ocsf_json_enabled", &value).unwrap();
         assert_eq!(stored, StoredSettingValue::Bool(true));
     }
 
@@ -8988,17 +9105,42 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dev-settings")]
+    #[tokio::test]
+    async fn update_config_global_policy_rejects_reserved_provider_key() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule(
+                    "_provider_work_github",
+                    "api.github.com",
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
     #[test]
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = StoredSettings {
             revision: 2,
             settings: [
                 (
-                    "log_level".to_string(),
-                    StoredSettingValue::String("warn".to_string()),
+                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    StoredSettingValue::Bool(false),
                 ),
-                ("dummy_int".to_string(), StoredSettingValue::Int(7)),
+                (
+                    settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+                    StoredSettingValue::Bool(false),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -9008,10 +9150,13 @@ mod tests {
             revision: 1,
             settings: [
                 (
-                    "log_level".to_string(),
-                    StoredSettingValue::String("debug".to_string()),
+                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    StoredSettingValue::Bool(true),
                 ),
-                ("dummy_bool".to_string(), StoredSettingValue::Bool(true)),
+                (
+                    "ocsf_json_enabled".to_string(),
+                    StoredSettingValue::Bool(true),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -9019,39 +9164,45 @@ mod tests {
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        let log_level = merged.get("log_level").expect("log_level present");
-        assert_eq!(log_level.scope, SettingScope::Global as i32);
+        let providers_v2 = merged
+            .get(settings::PROVIDERS_V2_ENABLED_KEY)
+            .expect("providers_v2_enabled present");
+        assert_eq!(providers_v2.scope, SettingScope::Global as i32);
         assert_eq!(
-            log_level.value.as_ref().and_then(|v| v.value.as_ref()),
-            Some(&setting_value::Value::StringValue("warn".to_string()))
+            providers_v2.value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(&setting_value::Value::BoolValue(false))
         );
 
-        let dummy_bool = merged.get("dummy_bool").expect("dummy_bool present");
-        assert_eq!(dummy_bool.scope, SettingScope::Sandbox as i32);
+        let ocsf_json = merged
+            .get("ocsf_json_enabled")
+            .expect("ocsf_json_enabled present");
+        assert_eq!(ocsf_json.scope, SettingScope::Sandbox as i32);
 
-        let dummy_int = merged.get("dummy_int").expect("dummy_int present");
-        assert_eq!(dummy_int.scope, SettingScope::Global as i32);
+        let proposals = merged
+            .get(settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY)
+            .expect("agent_policy_proposals_enabled present");
+        assert_eq!(proposals.scope, SettingScope::Global as i32);
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn merge_effective_settings_sandbox_scoped_value_has_sandbox_scope() {
         let global = StoredSettings::default();
         let sandbox = StoredSettings {
             revision: 1,
-            settings: [(
-                "log_level".to_string(),
-                StoredSettingValue::String("debug".to_string()),
-            )]
-            .into_iter()
+            settings: std::iter::once((
+                "ocsf_json_enabled".to_string(),
+                StoredSettingValue::Bool(true),
+            ))
             .collect(),
             ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        let log_level = merged.get("log_level").expect("log_level present");
-        assert_eq!(log_level.scope, SettingScope::Sandbox as i32);
-        assert!(log_level.value.is_some());
+        let ocsf_json = merged
+            .get("ocsf_json_enabled")
+            .expect("ocsf_json_enabled present");
+        assert_eq!(ocsf_json.scope, SettingScope::Sandbox as i32);
+        assert!(ocsf_json.value.is_some());
     }
 
     #[test]
@@ -9274,9 +9425,10 @@ mod tests {
             "log_level".to_string(),
             StoredSettingValue::String("error".to_string()),
         );
-        settings
-            .settings
-            .insert("dummy_bool".to_string(), StoredSettingValue::Bool(true));
+        settings.settings.insert(
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(true),
+        );
         settings.revision = 5;
         save_global_settings(&store, &settings).await.unwrap();
 
@@ -9287,7 +9439,7 @@ mod tests {
             Some(&StoredSettingValue::String("error".to_string()))
         );
         assert_eq!(
-            loaded.settings.get("dummy_bool"),
+            loaded.settings.get("ocsf_json_enabled"),
             Some(&StoredSettingValue::Bool(true))
         );
     }
@@ -9298,9 +9450,10 @@ mod tests {
 
         let sandbox_name = "my-sandbox";
         let mut settings = StoredSettings::default();
-        settings
-            .settings
-            .insert("dummy_int".to_string(), StoredSettingValue::Int(99));
+        settings.settings.insert(
+            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            StoredSettingValue::String("auto".to_string()),
+        );
         settings.revision = 3;
         save_sandbox_settings(&store, sandbox_name, &settings)
             .await
@@ -9309,8 +9462,8 @@ mod tests {
         let loaded = load_sandbox_settings(&store, sandbox_name).await.unwrap();
         assert_eq!(loaded.revision, 3);
         assert_eq!(
-            loaded.settings.get("dummy_int"),
-            Some(&StoredSettingValue::Int(99))
+            loaded.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY),
+            Some(&StoredSettingValue::String("auto".to_string()))
         );
     }
 
@@ -9434,14 +9587,15 @@ mod tests {
         let store = test_store().await;
 
         let mut global = StoredSettings::default();
-        global
-            .settings
-            .insert("dummy_int".to_string(), StoredSettingValue::Int(42));
+        global.settings.insert(
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(true),
+        );
         global.revision = 1;
         save_global_settings(&store, &global).await.unwrap();
 
         let loaded_global = load_global_settings(&store).await.unwrap();
-        assert!(loaded_global.settings.contains_key("dummy_int"));
+        assert!(loaded_global.settings.contains_key("ocsf_json_enabled"));
     }
 
     #[tokio::test]
@@ -9650,6 +9804,140 @@ mod tests {
         assert!(
             updated_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_user_policy_rejects_reserved_provider_key() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-user-reserved-key",
+                "user-reserved-key",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "user-reserved-key".to_string(),
+                policy: Some(test_policy_with_rule(
+                    "_provider_work_github",
+                    "api.github.com",
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    #[tokio::test]
+    async fn update_config_sandbox_sync_strips_reserved_provider_keys_before_persisting() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-sync-strip".to_string(),
+                name: "sync-strip".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("sync-strip")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        let mut synced_policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        synced_policy.network_policies.insert(
+            "_provider_work_github".to_string(),
+            NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let response = handle_update_config(
+            &state,
+            with_sandbox(
+                Request::new(UpdateConfigRequest {
+                    name: "sync-strip".to_string(),
+                    policy: Some(synced_policy),
+                    expected_resource_version: current_version,
+                    ..Default::default()
+                }),
+                "sb-sync-strip",
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.version, 1);
+
+        let updated_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("sync-strip")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec_policy = updated_sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.policy.as_ref())
+            .expect("spec.policy should be backfilled");
+        assert!(spec_policy.network_policies.contains_key("sandbox_only"));
+        assert!(
+            !spec_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        let persisted = state
+            .store
+            .get_latest_policy("sb-sync-strip")
+            .await
+            .unwrap()
+            .expect("policy revision should be persisted");
+        let persisted_policy = ProtoSandboxPolicy::decode(persisted.policy_payload.as_slice())
+            .expect("persisted policy should decode");
+        assert!(
+            persisted_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !persisted_policy
+                .network_policies
+                .contains_key("_provider_work_github")
         );
     }
 

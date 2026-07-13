@@ -91,13 +91,17 @@ Runtime layout:
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
   before publishing artifacts.
-- **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
-  Static linkage is required because the image is mounted/extracted into
-  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
-  init-container copy-self) and cannot rely on a dynamic loader.
+- **Supervisor**: Alpine base with `nftables`, static musl binary at
+  `/openshell-sandbox`. Static linkage keeps the binary usable when the image
+  is mounted/extracted into sandbox environments (Docker extraction, Podman
+  image volumes, Kubernetes init-container copy-self), while `nftables` supports
+  Kubernetes supervisor sidecar egress enforcement.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
+The Helm chart omits the supervisor image from gateway configuration unless an
+operator supplies a repository or tag override, preserving that build-time
+pairing for Kubernetes sandboxes as well.
 Package formulas also pin Docker supervisor extraction to the matching release
 image tag so standalone gateway binaries do not infer image tags from package
 versions.
@@ -125,6 +129,16 @@ backing the active local cluster: `k3d-*` contexts require Docker, `kind-*`
 contexts use `KIND_EXPERIMENTAL_PROVIDER=docker|podman` when set, and ambiguous
 or unknown contexts require an explicit `CONTAINER_ENGINE`. Other image builds
 do not infer from kube context.
+
+## Python Wheel Packaging
+
+The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
+build outputs of `mise run python:proto`. maturin honors `.gitignore` when
+collecting `python-source` files, so native builds (Linux CI, local
+`pip install .`) would drop them and ship an unimportable wheel. `pyproject.toml`
+pins them back in with `[tool.maturin].include` globs. The release workflows
+install each Linux wheel in a clean image and import `openshell.sandbox` as a
+smoke check.
 
 ## CI and E2E
 
