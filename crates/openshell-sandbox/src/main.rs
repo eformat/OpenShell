@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-use openshell_sandbox::run_sandbox;
+use openshell_sandbox::{run_sandbox, run_unidentified};
 
 /// Subcommand name used to self-copy the supervisor binary into a shared volume.
 ///
@@ -200,6 +200,12 @@ struct Args {
     /// Shared TLS work directory between the network init container and sidecar.
     #[arg(long, env = "OPENSHELL_PROXY_TLS_DIR", default_value = SIDECAR_TLS_DIR)]
     sidecar_tls_dir: String,
+
+    /// Start in unidentified mode for warm pool pods. The supervisor
+    /// listens on gRPC and waits for an `ActivateSandbox` call to receive
+    /// identity and policy before bootstrapping.
+    #[arg(long, env = "OPENSHELL_UNIDENTIFIED")]
+    unidentified: bool,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -451,7 +457,7 @@ fn main() -> Result<()> {
         });
     }
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if args.mode.network_init {
         let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);
@@ -576,10 +582,21 @@ fn main() -> Result<()> {
             vec!["/bin/bash".to_string()]
         };
 
+        if args.unidentified {
+            info!("Starting supervisor in unidentified mode (warm pool)");
+            match run_unidentified(args.health_check, args.health_port, ocsf_enabled.clone()).await {
+                Err(e) if e.to_string().starts_with("activation_received:") => {
+                    info!("Warm pool activation complete, starting sandbox via normal path");
+                    // Re-read env vars set by activation
+                    args.sandbox_id = std::env::var(openshell_core::sandbox_env::SANDBOX_ID).ok();
+                    args.sandbox = std::env::var(openshell_core::sandbox_env::SANDBOX).ok();
+                    args.openshell_endpoint = std::env::var(openshell_core::sandbox_env::ENDPOINT).ok();
+                }
+                other => return other,
+            }
+        }
+
         info!(command = ?command, "Starting sandbox");
-        // Note: "Starting sandbox" stays as plain info!() since the OCSF context
-        // is not yet initialized at this point (run_sandbox hasn't been called).
-        // The shorthand layer will render it in fallback format.
 
         run_sandbox(
             command,
