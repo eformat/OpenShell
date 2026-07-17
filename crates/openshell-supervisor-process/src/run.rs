@@ -101,6 +101,11 @@ pub async fn run_process(
     // the flag stays at its default (false) and no skill is installed.
     install_initial_agent_skill(sandbox_id, openshell_endpoint).await;
 
+    #[cfg(target_os = "linux")]
+    if enforcement_mode.uses_privileged_process_setup() {
+        crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
+    }
+
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
     // helpers (network namespace setup, nftables probes via run_networking),

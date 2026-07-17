@@ -61,12 +61,21 @@ impl ComputeDriver for ComputeDriverService {
             return Err(Status::invalid_argument("sandbox_name is required"));
         }
 
-        let sandbox = self
+        let mut sandbox = self
             .driver
             .get_sandbox(&request.sandbox_name)
             .await
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            .map_err(Status::internal)?;
+
+        if sandbox.is_none() && !request.sandbox_id.is_empty() {
+            sandbox = self
+                .driver
+                .get_sandbox_by_id(&request.sandbox_id)
+                .await
+                .map_err(Status::internal)?;
+        }
+
+        let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
 
         if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
             return Err(Status::failed_precondition(

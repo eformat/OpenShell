@@ -684,6 +684,26 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    pub async fn get_sandbox_by_id(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        let lp = ListParams::default()
+            .labels(&format!("{LABEL_SANDBOX_ID}={sandbox_id}"));
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
+            Ok(Ok(list)) => {
+                for obj in list.items {
+                    if let Ok(sandbox) = sandbox_from_object(&self.config.namespace, obj) {
+                        return Ok(Some(sandbox));
+                    }
+                }
+                Ok(None)
+            }
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err("timed out listing sandboxes by label".to_string()),
+        }
+    }
+
     pub async fn get_sandbox(&self, name: &str) -> Result<Option<Sandbox>, String> {
         info!(
             sandbox_name = %name,
@@ -697,7 +717,7 @@ impl KubernetesComputeDriver {
         match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
             Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
-                debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
+                debug!(sandbox_name = %name, "Sandbox not found by name in Kubernetes");
                 Ok(None)
             }
             Ok(Err(err)) => {
@@ -742,7 +762,8 @@ impl KubernetesComputeDriver {
                     .items
                     .into_iter()
                     .map(|obj| sandbox_from_object(&self.config.namespace, obj))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .filter_map(|r| r.ok())
+                    .collect::<Vec<_>>();
                 sandboxes.sort_by(|left, right| {
                     left.name
                         .cmp(&right.name)
@@ -782,6 +803,11 @@ impl KubernetesComputeDriver {
             KubernetesDriverError::InvalidArgument(status.message().to_string())
         })?;
         let name = sandbox.name.as_str();
+
+        if let Some(result) = self.try_warm_pool(sandbox).await {
+            return result;
+        }
+
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
@@ -900,6 +926,147 @@ impl KubernetesComputeDriver {
         }
     }
 
+    async fn try_warm_pool(&self, sandbox: &Sandbox) -> Option<Result<(), KubernetesDriverError>> {
+        let image = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .map_or(self.config.default_image.as_str(), |t| {
+                if t.image.is_empty() {
+                    self.config.default_image.as_str()
+                } else {
+                    t.image.as_str()
+                }
+            });
+
+        if image.is_empty() {
+            return None;
+        }
+
+        let pools =
+            match crate::warm_pool::list_warm_pools(&self.client, &self.config.namespace).await {
+                Ok(pools) => pools,
+                Err(e) => {
+                    debug!(error = %e, "Failed to list warm pools, falling back to cold start");
+                    return None;
+                }
+            };
+
+        let Some(pool) =
+            crate::warm_pool::find_matching_pool(&self.client, &self.config.namespace, &pools, image).await
+        else {
+            debug!(image = %image, "No warm pool found for image");
+            return None;
+        };
+
+        let pool_name = pool.metadata.name.as_deref().unwrap_or("unknown");
+
+        info!(
+            sandbox_id = %sandbox.id,
+            pool = %pool_name,
+            image = %image,
+            "Warm pool match found, attempting claim"
+        );
+
+        let claim_name = match crate::warm_pool::create_claim(
+            &self.client,
+            &self.config.namespace,
+            pool_name,
+            &sandbox.id,
+        )
+        .await
+        {
+            Ok(name) => name,
+            Err(e) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %e,
+                    "Failed to create warm pool claim, falling back to cold start"
+                );
+                return None;
+            }
+        };
+
+        let pod_ip = match crate::warm_pool::wait_for_claim_ready(
+            &self.client,
+            &self.config.namespace,
+            &claim_name,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    claim = %claim_name,
+                    error = %e,
+                    "Warm pool claim failed, falling back to cold start"
+                );
+                return None;
+            }
+        };
+
+        let tls: Option<crate::activation_client::TlsConfig> = None;
+
+        let sandbox_token = sandbox
+            .spec
+            .as_ref()
+            .map(|s| s.sandbox_token.clone())
+            .unwrap_or_default();
+
+        let request = openshell_core::proto::supervisor::v1::ActivateSandboxRequest {
+            sandbox_id: sandbox.id.clone(),
+            sandbox_name: sandbox.name.clone(),
+            sandbox_token,
+            gateway_endpoint: self.config.grpc_endpoint.clone(),
+            policy: Some(openshell_core::proto::sandbox::v1::SandboxPolicy::default()),
+        };
+
+        match crate::activation_client::activate_sandbox(&pod_ip, request, tls.as_ref()).await {
+            Ok(resp) if resp.success => {
+                info!(
+                    sandbox_id = %sandbox.id,
+                    pod_ip = %pod_ip,
+                    "Warm pool activation succeeded"
+                );
+                if let Err(e) = crate::warm_pool::annotate_claimed_pod(
+                    &self.client,
+                    &self.config.namespace,
+                    &claim_name,
+                    &sandbox.id,
+                    &sandbox.name,
+                )
+                .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        error = %e,
+                        "Failed to annotate/label warm pool pod and sandbox CR"
+                    );
+                }
+                Some(Ok(()))
+            }
+            Ok(resp) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error_message = %resp.error_message,
+                    error_code = resp.error_code,
+                    "Warm pool activation returned failure, falling back to cold start"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %e,
+                    "Warm pool activation error, falling back to cold start"
+                );
+                None
+            }
+        }
+    }
+
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, String> {
         info!(
             sandbox_name = %name,
@@ -994,11 +1161,7 @@ impl KubernetesComputeDriver {
                                         break;
                                     }
                                 }
-                                Err(err) => {
-                                    if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
-                                        break;
-                                    }
-                                }
+                                Err(_) => {}
                             }
                         }
                         Ok(Some(Event::Deleted(obj))) => {
@@ -1014,11 +1177,7 @@ impl KubernetesComputeDriver {
                                         break;
                                     }
                                 }
-                                Err(err) => {
-                                    if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
-                                        break;
-                                    }
-                                }
+                                Err(_) => {}
                             }
                         }
                         Ok(Some(Event::Restarted(objs))) => {
@@ -1035,11 +1194,7 @@ impl KubernetesComputeDriver {
                                             return;
                                         }
                                     }
-                                    Err(err) => {
-                                        if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
-                                            return;
-                                        }
-                                    }
+                                    Err(_) => {}
                                 }
                             }
                         }
@@ -1137,7 +1292,13 @@ fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
 
 fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
     let id = sandbox_id_from_object(&obj)?;
-    let name = obj.metadata.name.clone().unwrap_or_default();
+    let name = obj
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("openshell.ai/sandbox-name"))
+        .cloned()
+        .unwrap_or_else(|| obj.metadata.name.clone().unwrap_or_default());
     let namespace = obj
         .metadata
         .namespace
