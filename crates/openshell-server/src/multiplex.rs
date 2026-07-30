@@ -853,9 +853,10 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — pass through for dev /
-                // fronting-proxy deployments.
-                return inner.ready().await?.call(req).await;
+                // No auth configured — dev / fronting-proxy deployments.
+                // Inject a local-dev principal so downstream handlers that
+                // call extract_principal() always find one.
+                unauthenticated_dev_user_principal()
             };
 
             match principal {
@@ -1721,16 +1722,21 @@ mod tests {
             .with_span_events(FmtSpan::CLOSE);
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::subscriber::with_default(subscriber, || {
+            // Other parallel tests may register this callsite while no subscriber
+            // is active. Refresh the process-wide cache after installing this
+            // thread-local subscriber so the span cannot remain disabled.
+            tracing::callsite::rebuild_interest_cache();
 
-        let req = Request::builder()
-            .uri("/test-path")
-            .header("x-request-id", "trace-test-id-12345")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-        let span = make_request_span(&req);
-        drop(span.enter());
-        drop(span);
+            let req = Request::builder()
+                .uri("/test-path")
+                .header("x-request-id", "trace-test-id-12345")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let span = make_request_span(&req);
+            drop(span.enter());
+            drop(span);
+        });
 
         let output = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
         assert!(
@@ -2146,8 +2152,8 @@ mod tests {
                 "/openshell.v1.OpenShell/DeleteSandbox",
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
-                "/openshell.inference.v1.Inference/GetClusterInference",
-                "/openshell.inference.v1.Inference/SetClusterInference",
+                "/openshell.inference.v1.Inference/GetInferenceRoute",
+                "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
                 let chain = AuthenticatorChain::new(vec![mock]);

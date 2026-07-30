@@ -54,7 +54,7 @@ pub mod tracing_bus;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -161,6 +161,11 @@ pub struct ServerState {
     /// Gateway-local provider profile sources. User-imported profiles are read
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
+
+    /// OIDC admin role name for workspace-level authorization.
+    /// Empty when OIDC is not configured — `authorize_workspace()` treats
+    /// every authenticated user as Platform Admin in that case.
+    pub admin_role: String,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -171,12 +176,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
 }
 
 fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
-    let msg = error.to_string();
-    msg.contains("connection closed")
-        || msg.contains("connection reset")
-        || msg.contains("connection error")
-        || msg.contains("error reading a body from connection")
-        || msg.contains("broken pipe")
+    openshell_core::transport_errors::is_expected_transport_close_error(error)
 }
 
 impl ServerState {
@@ -194,6 +194,10 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let admin_role = config
+            .oidc
+            .as_ref()
+            .map_or_else(String::new, |oidc| oidc.admin_role.clone());
         Self {
             config,
             store,
@@ -215,6 +219,7 @@ impl ServerState {
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
+            admin_role,
         }
     }
 }
@@ -235,6 +240,9 @@ pub(crate) async fn run_server(
         config_file,
         guest_tls,
     } = startup;
+
+    auth::descriptor_authz::init()
+        .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
 
     let database_url = config.database_url.trim();
     if database_url.is_empty() {
@@ -429,6 +437,11 @@ pub(crate) async fn run_server(
     // shutdown so the running compute state matches the persisted store.
     // Runs before watchers spawn so the watch loop sees the post-resume
     // snapshot on its first poll.
+    ensure_default_workspace(&store).await?;
+
+    let gateway_listeners =
+        bind_gateway_listeners(config.bind_address, state.compute.gateway_bind_addresses()).await?;
+
     if let Err(err) = state.compute.resume_persisted_sandboxes().await {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
     }
@@ -440,18 +453,6 @@ pub(crate) async fn run_server(
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
-
-    let gateway_listener_addresses =
-        gateway_listener_addresses(config.bind_address, state.compute.gateway_bind_addresses());
-    let mut gateway_listeners = Vec::with_capacity(gateway_listener_addresses.len());
-    for address in gateway_listener_addresses {
-        let listener = TcpListener::bind(address)
-            .await
-            .map_err(|e| Error::transport(format!("failed to bind to {address}: {e}")))?;
-        let local_addr = listener.local_addr().unwrap_or(address);
-        info!(address = %local_addr, "Server listening");
-        gateway_listeners.push((listener, local_addr));
-    }
 
     // Bind the unauthenticated health endpoint on a separate port when configured.
     if let Some(health_bind_address) = config.health_bind_address {
@@ -565,6 +566,23 @@ fn gateway_listener_addresses(
         }
     }
     addresses
+}
+
+async fn bind_gateway_listeners(
+    bind_address: SocketAddr,
+    extra_addresses: &[SocketAddr],
+) -> Result<Vec<(TcpListener, SocketAddr)>> {
+    let addresses = gateway_listener_addresses(bind_address, extra_addresses);
+    let mut listeners = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind to {address}: {e}")))?;
+        let local_addr = listener.local_addr().unwrap_or(address);
+        info!(address = %local_addr, "Server listening");
+        listeners.push((listener, local_addr));
+    }
+    Ok(listeners)
 }
 
 fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
@@ -955,12 +973,71 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     }
 }
 
+pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
+    use grpc::workspace::{DEFAULT_WORKSPACE_NAME, WORKSPACE_OBJECT_TYPE};
+    use openshell_core::proto::Workspace;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use prost::Message;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let workspace = Workspace {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: DEFAULT_WORKSPACE_NAME.to_string(),
+            created_at_ms: persistence::current_time_ms(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            resource_version: 0,
+            workspace: String::new(),
+            deletion_timestamp_ms: 0,
+        }),
+        status: Some(openshell_core::proto::datamodel::v1::WorkspaceStatus {
+            phase: openshell_core::proto::datamodel::v1::WorkspacePhase::Active.into(),
+        }),
+    };
+
+    let labels_map = workspace.object_labels();
+    let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&labels_map).map_err(|e| Error::Config {
+                message: format!("failed to serialize labels: {e}"),
+            })?,
+        )
+    };
+    match store
+        .put_if(
+            WORKSPACE_OBJECT_TYPE,
+            &id,
+            DEFAULT_WORKSPACE_NAME,
+            "",
+            &workspace.encode_to_vec(),
+            labels_json.as_deref(),
+            persistence::WriteCondition::MustCreate,
+        )
+        .await
+    {
+        Ok(_) => {
+            info!("Created default workspace");
+            Ok(())
+        }
+        Err(persistence::PersistenceError::UniqueViolation { .. }) => {
+            debug!("Default workspace already exists");
+            Ok(())
+        }
+        Err(e) => Err(Error::config(format!(
+            "failed to ensure default workspace: {e}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure,
+        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
+        configured_compute_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
         kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
     };
     use openshell_core::{
@@ -969,7 +1046,10 @@ mod tests {
     };
     use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1089,7 +1169,7 @@ mod tests {
 
     fn service_request(addr: SocketAddr, extra_headers: &[(&str, &str)]) -> String {
         let mut request = format!(
-            "GET / HTTP/1.1\r\nHost: my-sandbox--web.dev.openshell.localhost:{}\r\nConnection: close\r\n",
+            "GET / HTTP/1.1\r\nHost: default--my-sandbox--web.dev.openshell.localhost:{}\r\nConnection: close\r\n",
             addr.port()
         );
         for (name, value) in extra_headers {
@@ -1220,7 +1300,7 @@ mod tests {
         let (addr, shutdown, handle, _tls_dir) =
             start_tls_gateway_listener("127.0.0.1:0", true).await;
         let origin = format!(
-            "http://my-sandbox--web.dev.openshell.localhost:{}",
+            "http://default--my-sandbox--web.dev.openshell.localhost:{}",
             addr.port()
         );
         let response = send_plain_http(
@@ -1450,6 +1530,30 @@ mod tests {
         assert_eq!(
             gateway_listener_addresses(primary, &[docker, docker]),
             vec![primary, docker]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_resume() {
+        let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_address = occupied_listener.local_addr().unwrap();
+        let resume_attempted = AtomicBool::new(false);
+        let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let result: openshell_core::Result<()> = async {
+            let _listeners = bind_gateway_listeners(primary_address, &[occupied_address]).await?;
+            resume_attempted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        .await;
+
+        assert!(
+            result.is_err(),
+            "binding the occupied extra gateway address should fail"
+        );
+        assert!(
+            !resume_attempted.load(Ordering::SeqCst),
+            "persisted sandbox resume must not run before every gateway listener is bound"
         );
     }
 }

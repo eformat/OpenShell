@@ -19,7 +19,9 @@ mod sidecar_control;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -54,17 +56,9 @@ use openshell_ocsf::{
 /// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
-/// Process-wide flag for the agent-driven policy proposal surface.
-/// Set once during `run_sandbox()` startup and updated by the settings poll
-/// loop when `agent_policy_proposals_enabled` changes. Read by the
-/// `policy.local` route handler and the L7 deny body's `next_steps` builder
-/// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
-/// unit tests in sibling modules can flip the flag through a serialized
-/// guard (see `policy_local::tests::ProposalsFlagGuard`).
-pub(crate) use openshell_core::proposals::AGENT_PROPOSALS_ENABLED;
-
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
@@ -105,9 +99,10 @@ pub async fn run_sandbox(
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     network_enabled: bool,
     process_enabled: bool,
+    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -162,60 +157,50 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine, retained_proto, middleware_registry_status, loaded_policy_origin) =
-        if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
-            let (policy, opa_engine, retained_proto, loaded_policy_origin) =
-                load_policy_from_sidecar_bootstrap(bootstrap)?;
-            (
-                policy,
-                opa_engine,
-                retained_proto,
-                MiddlewareRegistryStatus::Synchronized,
-                loaded_policy_origin,
-            )
-        } else {
-            load_policy(
-                sandbox_id.clone(),
-                sandbox,
-                openshell_endpoint.clone(),
-                policy_rules,
-                policy_data,
-            )
-            .await?
-        };
+    let (
+        mut policy,
+        opa_engine,
+        retained_proto,
+        middleware_registry_status,
+        loaded_policy_origin,
+        initial_agent_proposals_enabled,
+    ) = if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
+        let (policy, opa_engine, retained_proto, loaded_policy_origin) =
+            load_policy_from_sidecar_bootstrap(bootstrap)?;
+        (
+            policy,
+            opa_engine,
+            retained_proto,
+            MiddlewareRegistryStatus::Synchronized,
+            loaded_policy_origin,
+            bootstrap.agent_proposals_enabled,
+        )
+    } else {
+        load_policy(
+            sandbox_id.clone(),
+            sandbox,
+            openshell_endpoint.clone(),
+            policy_rules,
+            policy_data,
+        )
+        .await?
+    };
 
-    // Override the policy's process identity with the driver-resolved UID/GID
-    // from the pod environment. The policy defaults to the name "sandbox" which
-    // resolves via /etc/passwd, but the driver may have chosen a different
-    // numeric UID (e.g. from OpenShift SCC annotations).
-    // Validate overrides against the same rules as the policy layer to prevent
-    // env-injected values (e.g. GID 0) from bypassing policy restrictions.
-    if let Ok(uid) = std::env::var(openshell_core::sandbox_env::SANDBOX_UID)
-        && !uid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&uid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_UID contains invalid sandbox identity '{uid}'; \
-                 expected 'sandbox' or a numeric UID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        policy.process.run_as_user = Some(uid);
-    }
-    if let Ok(gid) = std::env::var(openshell_core::sandbox_env::SANDBOX_GID)
-        && !gid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&gid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_GID contains invalid sandbox identity '{gid}'; \
-                 expected 'sandbox' or a numeric GID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        policy.process.run_as_group = Some(gid);
-    }
+    // Normalize the active driver's identity contract once, while both the
+    // policy and launched image filesystem are available. Kubernetes and
+    // OpenShift retain their authoritative numeric pair; Docker and Podman
+    // fill only omitted policy fields from OCI Config.User.
+    #[cfg(unix)]
+    let resolved_process_identity = {
+        let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
+        openshell_supervisor_process::identity::resolve_process_identity(
+            &mut policy,
+            &driver_identity,
+        )?
+    };
+    #[cfg(not(unix))]
+    let resolved_process_identity =
+        openshell_supervisor_process::process::ResolvedProcessIdentity::default();
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let (provider_credentials, mut provider_env) =
@@ -292,25 +277,23 @@ pub async fn run_sandbox(
             let provider_env = provider_credentials.child_env_with_gcp_resolved();
             (provider_credentials, provider_env)
         };
+
+    // Shared agent-proposals feature flag. Seed from the same initial settings
+    // snapshot that produced the policy so networking and process setup agree
+    // before the poll loop starts reconciling later changes.
+    let agent_proposals = AgentProposals::new(initial_agent_proposals_enabled);
+
     let process_control_writer = process_control_connection
         .as_ref()
         .map(|connection| connection.writer.clone());
     let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
         process_control_closed = Some(connection.closed);
-        spawn_sidecar_control_update_watcher(connection.updates, provider_credentials.clone());
-    }
-
-    // Initialize the agent-proposals feature flag. Default false until the
-    // initial settings fetch (or the poll loop) tells us otherwise. The flag
-    // gates the skill install, the policy.local route handler, and the L7
-    // deny body's `next_steps` field — see `agent_proposals_enabled()`.
-    let proposals_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if AGENT_PROPOSALS_ENABLED
-        .set(proposals_enabled.clone())
-        .is_err()
-    {
-        debug!("agent proposals flag already initialized, keeping existing");
+        spawn_sidecar_control_update_watcher(
+            connection.updates,
+            provider_credentials.clone(),
+            agent_proposals.clone(),
+        );
     }
 
     // Shared PID: set after process spawn so the proxy can look up
@@ -363,6 +346,11 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     drop(bypass_activity_tx);
 
+    // Workspace watch: the policy poll loop learns the workspace from
+    // GetSandboxConfig and broadcasts it. Flush tasks and the policy.local
+    // API read the current value so proposals target the correct workspace.
+    let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
+
     let networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
@@ -386,6 +374,9 @@ pub async fn run_sandbox(
                 inference_routes.as_deref(),
                 denial_tx,
                 activity_tx,
+                agent_proposals.clone(),
+                workspace_rx.clone(),
+                &upstream_proxy_args,
             )
             .await?,
         )
@@ -418,6 +409,7 @@ pub async fn run_sandbox(
                 policy_proto: proto.clone(),
                 provider_env_revision: provider_credentials.snapshot().revision,
                 provider_child_env: provider_env.clone(),
+                agent_proposals_enabled: agent_proposals.enabled(),
                 proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
                 proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
             },
@@ -484,20 +476,31 @@ pub async fn run_sandbox(
             .unwrap_or(10);
 
         let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+        let denial_workspace_gate = workspace_rx.clone();
+        let denial_workspace_rx = workspace_rx.clone();
 
         tokio::spawn(async move {
             aggregator
-                .run(|summaries| {
-                    let endpoint = agg_endpoint.clone();
-                    let sandbox_name = agg_name.clone();
-                    async move {
-                        if let Err(e) =
-                            flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries).await
-                        {
-                            warn!(error = %e, "Failed to flush denial summaries to gateway");
+                .run(
+                    |summaries| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        let workspace = denial_workspace_rx.borrow().clone();
+                        async move {
+                            if let Err(e) = flush_proposals_to_gateway(
+                                &endpoint,
+                                &sandbox_name,
+                                &workspace,
+                                summaries,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
                         }
-                    }
-                })
+                    },
+                    move || !denial_workspace_gate.borrow().is_empty(),
+                )
                 .await;
         });
     }
@@ -518,20 +521,31 @@ pub async fn run_sandbox(
         );
 
         let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
+        let activity_workspace_gate = workspace_rx.clone();
+        let activity_workspace_rx = workspace_rx.clone();
 
         tokio::spawn(async move {
             aggregator
-                .run(move |summary| {
-                    let endpoint = agg_endpoint.clone();
-                    let sandbox_name = agg_name.clone();
-                    async move {
-                        if let Err(e) =
-                            flush_activity_to_gateway(&endpoint, &sandbox_name, summary).await
-                        {
-                            warn!(error = %e, "Failed to flush activity summary to gateway");
+                .run(
+                    move |summary| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        let workspace = activity_workspace_rx.borrow().clone();
+                        async move {
+                            if let Err(e) = flush_activity_to_gateway(
+                                &endpoint,
+                                &sandbox_name,
+                                &workspace,
+                                summary,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "Failed to flush activity summary to gateway");
+                            }
                         }
-                    }
-                })
+                    },
+                    move || !activity_workspace_gate.borrow().is_empty(),
+                )
                 .await;
         });
     }
@@ -565,8 +579,10 @@ pub async fn run_sandbox(
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
+            agent_proposals: agent_proposals.clone(),
             middleware_registry_status,
             sidecar_control_publisher: sidecar_control_publisher.clone(),
+            workspace_tx,
         };
 
         tokio::spawn(async move {
@@ -677,12 +693,14 @@ pub async fn run_sandbox(
             ssh_socket_path,
             sidecar_network_enforcement,
             &process_policy,
+            resolved_process_identity,
             process_enforcement_mode,
             entrypoint_pid,
             entrypoint_started_tx,
             provider_credentials,
             provider_env,
             ca_file_paths,
+            agent_proposals.clone(),
             #[cfg(target_os = "linux")]
             netns.as_ref(),
             #[cfg(target_os = "linux")]
@@ -843,11 +861,12 @@ fn load_policy_from_sidecar_bootstrap(
 fn spawn_sidecar_control_update_watcher(
     mut updates: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::ControlUpdate>,
     provider_credentials: ProviderCredentialState,
+    agent_proposals: AgentProposals,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
             match update {
-                sidecar_control::ControlUpdate::ProviderEnvUpdated {
+                sidecar_control::ControlUpdate::ProviderEnv {
                     revision,
                     provider_child_env,
                 } => {
@@ -868,7 +887,7 @@ fn spawn_sidecar_control_update_watcher(
                             .build()
                     );
                 }
-                sidecar_control::ControlUpdate::PolicyUpdated {
+                sidecar_control::ControlUpdate::Policy {
                     policy_proto,
                     policy_hash,
                     config_revision,
@@ -878,6 +897,19 @@ fn spawn_sidecar_control_update_watcher(
                         policy_hash,
                         config_revision,
                         "Received sidecar policy update for process supervisor"
+                    );
+                }
+                sidecar_control::ControlUpdate::AgentProposals {
+                    enabled,
+                    config_revision,
+                } => {
+                    apply_agent_proposals_enabled(
+                        &agent_proposals,
+                        enabled,
+                        "sidecar control",
+                        Some(config_revision),
+                        None,
+                        skills::install_static_skills,
                     );
                 }
             }
@@ -898,8 +930,9 @@ fn spawn_sidecar_entrypoint_handler(
     tokio::spawn(async move {
         let mut session_started = false;
         let mut trusted_supervisor_pid = None;
+        let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
-            entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
+            entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
                 info!(
                     pid = started.pid,
@@ -946,11 +979,13 @@ fn spawn_sidecar_entrypoint_handler(
                     trusted_ssh_socket_path.clone(),
                     None,
                     Some(supervisor_pid),
+                    Arc::clone(&terminating),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
             }
         }
+        terminating.store(true, Ordering::Release);
     });
 }
 
@@ -983,12 +1018,14 @@ fn process_policy_for_topology(
 async fn flush_proposals_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
+    workspace: &str,
     summaries: Vec<denial_aggregator::FlushableDenialSummary>,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialSummary, L7RequestSample};
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
+    client.set_workspace(workspace.to_string());
 
     let proto_summaries: Vec<DenialSummary> = summaries
         .into_iter()
@@ -1051,12 +1088,14 @@ async fn flush_proposals_to_gateway(
 async fn flush_activity_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
+    workspace: &str,
     summary: activity_aggregator::FlushableActivitySummary,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
+    client.set_workspace(workspace.to_string());
 
     let proto_summary = NetworkActivitySummary {
         network_activity_count: summary.network_activity_count,
@@ -1800,6 +1839,7 @@ async fn load_policy(
     Option<openshell_core::proto::SandboxPolicy>,
     MiddlewareRegistryStatus,
     LoadedPolicyOrigin,
+    bool,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1848,6 +1888,7 @@ async fn load_policy(
             None,
             MiddlewareRegistryStatus::Synchronized,
             LoadedPolicyOrigin::LocalOverride,
+            false,
         ));
     }
 
@@ -1891,12 +1932,14 @@ async fn load_policy(
 
             // Sync and re-fetch over a single connection to avoid extra
             // TLS handshakes.
+            let ws = snapshot.workspace.clone();
             snapshot = grpc_retry("Policy discovery sync", || {
                 openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
                     endpoint,
                     id,
                     sandbox,
                     &discovered,
+                    &ws,
                 )
             })
             .await?;
@@ -1923,6 +1966,7 @@ async fn load_policy(
                     id,
                     sandbox_name,
                     &sync_policy,
+                    &snapshot.workspace,
                 )
                 .await
                 {
@@ -2026,6 +2070,7 @@ async fn load_policy(
             LoadedPolicyOrigin::Gateway {
                 revision: loaded_policy_revision,
             },
+            agent_proposals_enabled_from_settings(&snapshot.settings),
         ));
     }
 
@@ -2467,11 +2512,13 @@ struct PolicyPollLoopContext {
     loaded_policy_origin: LoadedPolicyOrigin,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
+    agent_proposals: AgentProposals,
     middleware_registry_status: MiddlewareRegistryStatus,
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
+    workspace_tx: tokio::sync::watch::Sender<String>,
 }
 
 async fn connect_middleware_registry(
@@ -2583,35 +2630,54 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     // policy revision the supervisor actually loaded. A mismatched result is
     // reconciled below instead of being recorded as already applied.
     match client.poll_settings(&ctx.sandbox_id).await {
-        Ok(result) => match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
-            InitialPollDisposition::Acknowledge(candidate) => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                current_config_revision = candidate.config_revision;
-                current_policy_hash.clone_from(&candidate.policy_hash);
-                current_middleware_services = result.supervisor_middleware_services;
-                current_settings = result.settings;
-                enqueue_policy_status(
-                    &status_sender,
-                    PolicyStatusUpdate::initial_loaded(&candidate),
-                );
-                debug!(
-                    config_revision = current_config_revision,
-                    "Settings poll: initial policy matches loaded revision"
-                );
+        Ok(result) => {
+            let _ = ctx.workspace_tx.send(client.workspace());
+            match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
+                InitialPollDisposition::Acknowledge(candidate) => {
+                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_agent_proposals_enabled(
+                        &ctx.agent_proposals,
+                        agent_proposals_enabled_from_settings(&result.settings),
+                        "initial settings poll",
+                        Some(candidate.config_revision),
+                        ctx.sidecar_control_publisher.as_ref(),
+                        skills::install_static_skills,
+                    );
+                    current_config_revision = candidate.config_revision;
+                    current_policy_hash.clone_from(&candidate.policy_hash);
+                    current_middleware_services = result.supervisor_middleware_services;
+                    current_settings = result.settings;
+                    enqueue_policy_status(
+                        &status_sender,
+                        PolicyStatusUpdate::initial_loaded(&candidate),
+                    );
+                    debug!(
+                        config_revision = current_config_revision,
+                        "Settings poll: initial policy matches loaded revision"
+                    );
+                }
+                InitialPollDisposition::Reconcile => pending_result = Some(result),
+                InitialPollDisposition::TrackOnly => {
+                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_agent_proposals_enabled(
+                        &ctx.agent_proposals,
+                        agent_proposals_enabled_from_settings(&result.settings),
+                        "initial settings poll",
+                        Some(result.config_revision),
+                        ctx.sidecar_control_publisher.as_ref(),
+                        skills::install_static_skills,
+                    );
+                    current_config_revision = result.config_revision;
+                    current_policy_hash = result.policy_hash.clone();
+                    current_middleware_services = result.supervisor_middleware_services;
+                    current_settings = result.settings;
+                    debug!(
+                        config_revision = current_config_revision,
+                        "Settings poll: tracking gateway config while preserving local policy override"
+                    );
+                }
             }
-            InitialPollDisposition::Reconcile => pending_result = Some(result),
-            InitialPollDisposition::TrackOnly => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                current_config_revision = result.config_revision;
-                current_policy_hash = result.policy_hash.clone();
-                current_middleware_services = result.supervisor_middleware_services;
-                current_settings = result.settings;
-                debug!(
-                    config_revision = current_config_revision,
-                    "Settings poll: tracking gateway config while preserving local policy override"
-                );
-            }
-        },
+        }
         Err(e) => {
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
@@ -2624,7 +2690,10 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         } else {
             tokio::time::sleep(interval).await;
             match client.poll_settings(&ctx.sandbox_id).await {
-                Ok(result) => result,
+                Ok(result) => {
+                    let _ = ctx.workspace_tx.send(client.workspace());
+                    result
+                }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
                     continue;
@@ -2872,34 +2941,16 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         // off picks up the surface without a recreate. We never uninstall on
         // a true→false transition: stale skill content on disk is harmless
         // because route_request and agent_next_steps both gate on the live
-        // atomic, so the agent that reads the skill will see 404s and an
+        // shared flag, so the agent that reads the skill will see 404s and an
         // empty `next_steps` array regardless.
-        if let Some(flag) = AGENT_PROPOSALS_ENABLED.get() {
-            let new_proposals = extract_bool_setting(
-                &result.settings,
-                openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
-            )
-            .unwrap_or(false);
-            let prev_proposals = flag.swap(new_proposals, Ordering::Relaxed);
-            if new_proposals != prev_proposals {
-                info!(
-                    agent_policy_proposals_enabled = new_proposals,
-                    "agent-driven policy proposals toggled"
-                );
-                if new_proposals && !prev_proposals {
-                    match skills::install_static_skills() {
-                        Ok(installed) => info!(
-                            path = %installed.policy_advisor.display(),
-                            "Installed sandbox agent skill on toggle-on"
-                        ),
-                        Err(error) => warn!(
-                            error = %error,
-                            "Failed to install sandbox agent skill on toggle-on"
-                        ),
-                    }
-                }
-            }
-        }
+        apply_agent_proposals_enabled(
+            &ctx.agent_proposals,
+            agent_proposals_enabled_from_settings(&result.settings),
+            "settings poll",
+            Some(result.config_revision),
+            ctx.sidecar_control_publisher.as_ref(),
+            skills::install_static_skills,
+        );
 
         current_config_revision = result.config_revision;
         if !reloads_gateway_policy {
@@ -2910,7 +2961,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 }
 
 fn apply_ocsf_json_setting(
-    enabled: &std::sync::atomic::AtomicBool,
+    enabled: &AtomicBool,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 ) {
     use std::sync::atomic::Ordering;
@@ -2936,6 +2987,52 @@ fn extract_bool_setting(
             setting_value::Value::BoolValue(b) => Some(*b),
             _ => None,
         })
+}
+
+fn agent_proposals_enabled_from_settings(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) -> bool {
+    extract_bool_setting(
+        settings,
+        openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+    )
+    .unwrap_or(false)
+}
+
+fn apply_agent_proposals_enabled(
+    agent_proposals: &AgentProposals,
+    enabled: bool,
+    source: &'static str,
+    config_revision: Option<u64>,
+    sidecar_control_publisher: Option<&sidecar_control::Publisher>,
+    install_static_skills: impl FnOnce() -> Result<skills::InstalledSkills>,
+) {
+    let previously_enabled = agent_proposals.swap_enabled(enabled);
+    if enabled == previously_enabled {
+        return;
+    }
+
+    info!(
+        agent_policy_proposals_enabled = enabled,
+        source, config_revision, "agent-driven policy proposals toggled"
+    );
+
+    if let (Some(publisher), Some(config_revision)) = (sidecar_control_publisher, config_revision) {
+        publisher.publish_agent_proposals(enabled, config_revision);
+    }
+
+    if enabled && !previously_enabled {
+        match install_static_skills() {
+            Ok(installed) => info!(
+                path = %installed.policy_advisor.display(),
+                "Installed sandbox agent skill on toggle-on"
+            ),
+            Err(error) => warn!(
+                error = %error,
+                "Failed to install sandbox agent skill on toggle-on"
+            ),
+        }
+    }
 }
 
 /// Log individual setting changes between two snapshots.
@@ -3019,7 +3116,7 @@ mod tests {
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn proxy_policy(http_addr: Option<std::net::SocketAddr>) -> SandboxPolicy {
         SandboxPolicy {
@@ -3091,9 +3188,13 @@ mod tests {
             1,
             std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
         );
-        let handle = spawn_sidecar_control_update_watcher(rx, provider_credentials.clone());
+        let handle = spawn_sidecar_control_update_watcher(
+            rx,
+            provider_credentials.clone(),
+            AgentProposals::default(),
+        );
 
-        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
             revision: 2,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
@@ -3119,7 +3220,7 @@ mod tests {
             Some("new")
         );
 
-        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
             revision: 1,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
@@ -3137,6 +3238,72 @@ mod tests {
             Some("new")
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sidecar_control_agent_proposals_update_flips_shared_state() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider_credentials =
+            ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
+        let agent_proposals = AgentProposals::new(true);
+        let handle =
+            spawn_sidecar_control_update_watcher(rx, provider_credentials, agent_proposals.clone());
+
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: false,
+            config_revision: 5,
+        })
+        .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !agent_proposals.enabled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.abort();
+    }
+
+    #[test]
+    fn apply_agent_proposals_enabled_installs_only_on_false_to_true() {
+        let agent_proposals = AgentProposals::default();
+        let installs = AtomicUsize::new(0);
+
+        apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(1), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert!(agent_proposals.enabled());
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
+
+        apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(2), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
+
+        apply_agent_proposals_enabled(&agent_proposals, false, "test", Some(3), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert!(!agent_proposals.enabled());
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -3160,6 +3327,24 @@ mod tests {
         assert!(!enabled.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn agent_proposals_setting_enables_from_initial_settings_snapshot() {
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+            effective_bool(true),
+        );
+
+        assert!(agent_proposals_enabled_from_settings(&settings));
+    }
+
+    #[test]
+    fn agent_proposals_setting_defaults_false_when_unset() {
+        let settings = std::collections::HashMap::new();
+
+        assert!(!agent_proposals_enabled_from_settings(&settings));
+    }
+
     // ---- Policy disk discovery tests ----
 
     #[test]
@@ -3168,9 +3353,10 @@ mod tests {
         let policy = discover_policy_from_path(path);
         // Restrictive default has no network policies.
         assert!(policy.network_policies.is_empty());
-        // But does have filesystem and process policies.
+        // It keeps filesystem restrictions while leaving identity to the
+        // active compute driver.
         assert!(policy.filesystem.is_some());
-        assert!(policy.process.is_some());
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -3240,9 +3426,7 @@ filesystem_policy:
 
         let policy = discover_policy_from_path(&path);
         // Falls back to restrictive default because of root user.
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -3275,6 +3459,7 @@ filesystem_policy:
             global_policy_version: 0,
             provider_env_revision: 0,
             supervisor_middleware_services: Vec::new(),
+            workspace: String::new(),
         }
     }
 
@@ -3552,6 +3737,23 @@ filesystem_policy:
                 PolicyStatusUpdate::loaded(version)
             );
         }
+    }
+
+    #[test]
+    fn settings_snapshot_carries_workspace_for_policy_sync() {
+        let mut snapshot = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        snapshot.workspace = "beta".to_string();
+
+        let revision = LoadedPolicyRevision::from_snapshot(&snapshot);
+        assert_eq!(revision.version, 1);
+        assert_eq!(
+            snapshot.workspace, "beta",
+            "workspace must survive the snapshot so sync_policy_and_fetch_snapshot receives it"
+        );
     }
 }
 

@@ -377,7 +377,7 @@ Verification has two phases: unit tests + pre-commit, then E2E tests (if applica
 On each attempt:
 
 ```bash
-# Run pre-commit checks (includes unit tests, linting, formatting)
+# Run pre-commit checks (linting, formatting, license headers)
 mise run pre-commit
 ```
 
@@ -443,6 +443,8 @@ rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the
 same branch. If the change affects user-facing compute-driver setup, also
 update `docs/reference/sandbox-compute-drivers.mdx` or the relevant deployment
 page.
+
+Use the `sync-agent-infra` skill's maintenance map to identify related skill updates when the implementation changes behavior, commands, or development workflows. Run its full consistency check when the implementation adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references. Fix any drift before committing.
 
 ### Step 12: Commit and Push
 
@@ -638,7 +640,7 @@ If the `state:in-progress` label is present, the skill was previously started bu
 | `gh pr list --state open --search "..."` | Search for open PRs |
 | `gh pr create --title "..." --body "..."` | Create a pull request |
 | `gh api user --jq '.login'` | Get current GitHub username |
-| `mise run pre-commit` | Run pre-commit checks (includes unit tests, lint, format) |
+| `mise run pre-commit` | Run pre-commit checks (lint, format, license headers) |
 | `mise run e2e:docker` | Run smoke E2E against a standalone Docker-backed gateway |
 | `mise run e2e:podman` | Run smoke E2E against a Podman-backed gateway |
 | `mise run e2e:vm` | Run smoke E2E against the VM compute driver |

@@ -137,13 +137,35 @@ Supported auth modes:
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
+The CLI persists the scopes requested during OIDC login in gateway metadata and
+reuses them when refreshing an access token. This preserves the intended API
+resource selection for identity providers that bind access-token audiences to
+OAuth scopes.
+
+Gateway health and user authentication are separate probes. `OpenShell.Health`
+remains unauthenticated so deployment and load-balancer health checks do not
+depend on user credentials. The CLI uses the existing, side-effect-free
+`OpenShell.GetGatewayInfo` capability query as its protected authentication
+probe. `Unauthenticated` means the credentials were rejected, while
+`PermissionDenied` proves authentication succeeded before the caller failed
+the capability query's admin authorization check. The CLI combines the health
+and capability results so a reachable gateway with an expired or rejected
+token is reported as connected but unauthenticated.
+
 Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
 does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
 ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
 that JWT on subsequent gateway RPCs.
-User-facing mutations are authorized by role policy when OIDC or edge identity
-is enabled.
+User-facing RPCs are authorized by descriptor-declared role and scope policy
+when OIDC or edge identity is enabled. The OIDC admin role grants platform-wide
+access and bypasses workspace membership checks. Workspace Admin and Workspace
+User roles are durable membership records keyed by workspace and authenticated
+subject. Handlers resolve the resource workspace and require sufficient
+membership after the middleware validates the global role and optional scope.
+The authenticated `GetCurrentUser` endpoint exposes the gateway's validated
+user subject, display name, roles, scopes, and identity provider for CLI
+identity inspection without client-side token decoding.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
