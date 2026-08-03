@@ -238,6 +238,7 @@ pub async fn annotate_claimed_pod(
     claim_name: &str,
     sandbox_id: &str,
     sandbox_name: &str,
+    workspace: &str,
 ) -> Result<(), WarmPoolError> {
     let (claim_api, _) = claim_api(client.clone(), namespace);
     let claim = claim_api.get(claim_name).await?;
@@ -273,10 +274,13 @@ pub async fn annotate_claimed_pod(
         "metadata": {
             "labels": {
                 "openshell.ai/sandbox-id": sandbox_id,
+                "openshell.ai/sandbox-name": sandbox_name,
+                "openshell.ai/sandbox-workspace": workspace,
                 "openshell.ai/managed-by": "openshell"
             },
             "annotations": {
-                "openshell.ai/sandbox-name": sandbox_name
+                "openshell.ai/sandbox-name": sandbox_name,
+                "openshell.ai/sandbox-workspace": workspace
             }
         }
     });

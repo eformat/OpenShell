@@ -1058,6 +1058,7 @@ impl KubernetesComputeDriver {
                     &claim_name,
                     &sandbox.id,
                     &sandbox.name,
+                    &sandbox.workspace,
                 )
                 .await
                 {

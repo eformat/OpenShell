@@ -98,7 +98,10 @@ pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, 
         let Some(encoded) = host.strip_suffix(&expected_suffix) else {
             continue;
         };
-        let (workspace, rest) = encoded.split_once("--")?;
+        // Support legacy format (no workspace prefix): retail-finance.apps... → workspace=default
+        let (workspace, rest) = encoded
+            .split_once("--")
+            .unwrap_or(("default", encoded));
         if workspace.is_empty() || workspace.contains("--") {
             return None;
         }

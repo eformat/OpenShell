@@ -155,6 +155,20 @@ static VERTEX_AI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &[],
 };
 
+/// Anthropic-compatible API endpoint with bearer-token auth (e.g. MaaS endpoints
+/// that speak the Anthropic Messages API but require `Authorization: Bearer`
+/// rather than `x-api-key`). Credential key: `ANTHROPIC_AUTH_TOKEN`.
+static ANTHROPIC_OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "anthropic-openai",
+    default_base_url: "",
+    protocols: ANTHROPIC_PROTOCOLS,
+    credential_key_names: &["ANTHROPIC_AUTH_TOKEN"],
+    base_url_config_keys: &["ANTHROPIC_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[("anthropic-version", "2023-06-01")],
+    passthrough_headers: &["anthropic-version", "anthropic-beta"],
+};
+
 static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "nvidia",
     default_base_url: "https://integrate.api.nvidia.com/v1",
@@ -220,6 +234,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
     match input.trim().to_ascii_lowercase().as_str() {
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
+        "anthropic-openai" => Some("anthropic-openai"),
         "nvidia" => Some("nvidia"),
         "deepinfra" => Some("deepinfra"),
         "aws-bedrock" => Some("aws-bedrock"),
@@ -238,6 +253,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
     match normalize_inference_provider_type(provider_type)? {
         "openai" => Some(&OPENAI_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
+        "anthropic-openai" => Some(&ANTHROPIC_OPENAI_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
         "deepinfra" => Some(&DEEPINFRA_PROFILE),
         "google-vertex-ai" => Some(&VERTEX_AI_PROFILE),
