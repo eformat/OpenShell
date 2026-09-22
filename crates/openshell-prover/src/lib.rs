@@ -8,6 +8,7 @@
 //! paths and write-bypass violations.
 
 pub mod accepted_risks;
+pub mod containment;
 pub mod credentials;
 pub mod finding;
 pub mod model;
@@ -105,10 +106,11 @@ mod tests {
     fn test_filesystem_policy() {
         let path = testdata_dir().join("policy.yaml");
         let model = parse_policy(&path).expect("failed to parse policy");
-        let readable = model.filesystem_policy.readable_paths();
+        let readable = model.filesystem_policy.readable_paths(None);
         assert!(readable.contains(&"/usr".to_owned()));
         assert!(readable.contains(&"/sandbox".to_owned()));
         assert!(readable.contains(&"/tmp".to_owned()));
+        assert!(readable.contains(&policy::WORKDIR_PATH_SYMBOL.to_owned()));
     }
 
     // 3. Workdir NOT included by default (matches runtime behavior).
@@ -121,8 +123,38 @@ filesystem_policy:
     - /usr
 ";
         let model = policy::parse_policy_str(yaml).expect("parse");
-        let readable = model.filesystem_policy.readable_paths();
+        let readable = model.filesystem_policy.readable_paths(None);
         assert!(!readable.contains(&"/sandbox".to_owned()));
+        assert!(!readable.contains(&policy::WORKDIR_PATH_SYMBOL.to_owned()));
+    }
+
+    #[test]
+    fn absent_filesystem_uses_runtime_effective_workdir_default() {
+        let model = policy::parse_policy_str("version: 1\n").expect("parse");
+        assert!(model.filesystem_policy.include_workdir);
+        assert!(
+            model
+                .filesystem_policy
+                .readable_paths(None)
+                .contains(&policy::WORKDIR_PATH_SYMBOL.to_owned())
+        );
+    }
+
+    #[test]
+    fn policy_parser_requires_version_and_rejects_unknown_authority() {
+        assert!(policy::parse_policy_str("network_policies: {}\n").is_err());
+        assert!(policy::parse_policy_str("version: 1\nfuture_authority: true\n").is_err());
+    }
+
+    #[test]
+    fn explicit_tcp_is_l4_in_the_risk_projection() {
+        let model = policy::parse_policy_str(
+            "version: 1\nnetwork_policies:\n  tcp:\n    endpoints:\n      - host: example.com\n        port: 443\n        protocol: tcp\n",
+        )
+        .expect("parse");
+        let endpoint = &model.network_policies["tcp"].endpoints[0];
+        assert!(!endpoint.is_l7_enforced());
+        assert_eq!(endpoint.intent(), policy::PolicyIntent::L4Only);
     }
 
     // 4. Workdir excluded when include_workdir: false.
@@ -136,8 +168,9 @@ filesystem_policy:
     - /usr
 ";
         let model = policy::parse_policy_str(yaml).expect("parse");
-        let readable = model.filesystem_policy.readable_paths();
+        let readable = model.filesystem_policy.readable_paths(None);
         assert!(!readable.contains(&"/sandbox".to_owned()));
+        assert!(!readable.contains(&policy::WORKDIR_PATH_SYMBOL.to_owned()));
     }
 
     // 5. No duplicate when workdir already in read_write.
@@ -152,12 +185,30 @@ filesystem_policy:
     - /tmp
 ";
         let model = policy::parse_policy_str(yaml).expect("parse");
-        let readable = model.filesystem_policy.readable_paths();
+        let readable = model.filesystem_policy.readable_paths(Some("/sandbox"));
         let sandbox_count = readable.iter().filter(|p| *p == "/sandbox").count();
         assert_eq!(sandbox_count, 1);
     }
 
-    // 6. End-to-end: testdata policy with a github credential in scope and a
+    // 6. A resolved non-default workdir does not replace an explicit path.
+    #[test]
+    fn test_include_workdir_preserves_explicit_sandbox_path() {
+        let yaml = r"
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_write:
+    - /sandbox
+";
+        let model = policy::parse_policy_str(yaml).expect("parse");
+        let readable = model
+            .filesystem_policy
+            .readable_paths(Some("/workspace/project"));
+        assert!(readable.contains(&"/sandbox".to_owned()));
+        assert!(readable.contains(&"/workspace/project".to_owned()));
+    }
+
+    // 7. End-to-end: testdata policy with a github credential in scope and a
     // bypass-L7 binary (git) emits an `l7_bypass_credentialed` finding.
     // The prover output is categorical, not severity-graded.
     #[test]

@@ -22,6 +22,8 @@ pub enum AuthMode {
     /// Either sandbox principal or Bearer; scope and role apply on
     /// the Bearer path only.
     Dual,
+    /// Only callable by a gateway peer principal.
+    Peer,
 }
 
 /// Coarse role mapping. Maps to the configured `admin_role` /
@@ -86,9 +88,15 @@ pub fn is_sandbox_callable(method: &str) -> bool {
 #[must_use]
 pub fn is_user_callable(method: &str) -> bool {
     match lookup(method).map(|m| m.auth_mode) {
-        Some(AuthMode::Sandbox | AuthMode::Unauthenticated) => false,
+        Some(AuthMode::Sandbox | AuthMode::Unauthenticated | AuthMode::Peer) => false,
         Some(AuthMode::Bearer | AuthMode::Dual) | None => true,
     }
+}
+
+/// `true` if the method is callable by a gateway peer.
+#[must_use]
+pub fn is_peer_callable(method: &str) -> bool {
+    matches!(lookup(method).map(|m| m.auth_mode), Some(AuthMode::Peer))
 }
 
 #[cfg(test)]
@@ -128,6 +136,9 @@ mod tests {
         assert!(!is_user_callable(
             "/openshell.v1.OpenShell/ReportPolicyStatus"
         ));
+        assert!(!is_user_callable(
+            "/openshell.v1.OpenShell/ReportSandboxConfiguration"
+        ));
         assert!(!is_user_callable("/openshell.v1.OpenShell/PushSandboxLogs"));
         assert!(!is_user_callable(
             "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
@@ -139,13 +150,33 @@ mod tests {
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         assert!(!is_user_callable("/openshell.v1.OpenShell/RelayStream"));
-        assert!(!is_user_callable(
-            "/openshell.inference.v1.Inference/GetInferenceBundle"
-        ));
+        for path in [
+            "/openshell.v1.OpenShell/PeerRelay",
+            "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+            "/openshell.v1.OpenShell/PeerReportEndpointStatus",
+            "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus",
+        ] {
+            assert!(!is_user_callable(path));
+            assert!(is_peer_callable(path));
+        }
         // Unauthenticated methods are not "user callable" — they're
         // intercepted before principal evaluation.
         assert!(!is_user_callable("/openshell.v1.OpenShell/Health"));
         // Unknown method falls through to AuthzPolicy::check.
         assert!(is_user_callable("/openshell.v1.OpenShell/FutureMethod"));
+    }
+
+    #[test]
+    fn sandbox_lifecycle_mutations_require_user_write_authority() {
+        for path in [
+            "/openshell.v1.OpenShell/StopSandbox",
+            "/openshell.v1.OpenShell/StartSandbox",
+        ] {
+            let entry = lookup(path).expect("lifecycle RPC must have auth metadata");
+            assert_eq!(entry.auth_mode, AuthMode::Bearer);
+            assert_eq!(entry.scope.as_deref(), Some("sandbox:write"));
+            assert_eq!(entry.workspace_role.as_deref(), Some("user"));
+            assert!(!is_sandbox_callable(path));
+        }
     }
 }

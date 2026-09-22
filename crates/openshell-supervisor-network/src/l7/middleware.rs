@@ -8,7 +8,8 @@ use crate::opa::PolicyGenerationGuard;
 use miette::{Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    HttpActivityBuilder, HttpRequest, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
+    ocsf_emit,
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -18,6 +19,94 @@ pub enum MiddlewareApplyResult {
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
     },
+    /// The platform's shared active-work and waiter capacities were both full.
+    ///
+    /// This is platform load shedding, not a selected middleware-stage failure,
+    /// so callers must not apply a stage's `on_error` policy.
+    AdmissionExhausted,
+}
+
+/// One destination-selected middleware chain shared by an HTTP request and
+/// its matching response. The request and response phases filter bindings
+/// independently, so the full chain must remain available until relay ends.
+#[derive(Clone)]
+pub struct HttpMiddlewareExchange {
+    request_id: String,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: openshell_supervisor_middleware::ChainRunner,
+    generation_guard: PolicyGenerationGuard,
+}
+
+impl HttpMiddlewareExchange {
+    pub fn new(
+        request_id: String,
+        chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+        runner: openshell_supervisor_middleware::ChainRunner,
+        generation_guard: PolicyGenerationGuard,
+    ) -> Self {
+        Self {
+            request_id,
+            chain,
+            runner,
+            generation_guard,
+        }
+    }
+
+    pub async fn apply_request<C>(
+        &self,
+        request: crate::l7::provider::L7Request,
+        client: &mut C,
+        ctx: &L7EvalContext,
+        scheme: &str,
+        transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    ) -> Result<MiddlewareApplyResult>
+    where
+        C: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        apply_middleware_chain_for_scheme_with_request_id(
+            request,
+            client,
+            ctx,
+            scheme,
+            self.chain.clone(),
+            &self.runner,
+            &self.generation_guard,
+            transformed_body_policy,
+            &self.request_id,
+        )
+        .await
+    }
+
+    pub fn response_relay<'a>(
+        &'a self,
+        request: &crate::l7::provider::L7Request,
+        ctx: &'a L7EvalContext,
+        scheme: &str,
+    ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
+        let sandbox = openshell_ocsf::ctx::ctx();
+        crate::l7::rest::HttpResponseMiddlewareRelay {
+            chain: &self.chain,
+            runner: &self.runner,
+            request_context: openshell_core::proto::RequestContext {
+                request_id: self.request_id.clone(),
+                sandbox_id: sandbox.sandbox_id.clone(),
+                sandbox: sandbox.sandbox_name.clone(),
+                workspace: ctx.workspace.clone(),
+                originating_process: None,
+            },
+            target: openshell_core::proto::HttpRequestTarget {
+                scheme: scheme.to_string(),
+                host: ctx.host.clone(),
+                port: u32::from(ctx.port),
+                method: request.action.clone(),
+                path: request.target.clone(),
+                query: super::relay::policy_safe_response_query(&request.query_params),
+            },
+            policy_name: &ctx.policy_name,
+            generation_guard: Some(&self.generation_guard),
+            whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+        }
+    }
 }
 
 /// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
@@ -83,6 +172,321 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
     ocsf_emit!(event);
 }
 
+pub fn emit_websocket_preflight_events(
+    ctx: &L7EvalContext,
+    outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
+) {
+    emit_websocket_invocations(ctx, &outcome.invocations);
+    emit_websocket_coverage(ctx, &outcome.coverage);
+    for event in websocket_preflight_finding_events(outcome) {
+        ocsf_emit!(event);
+    }
+    if outcome.saturated {
+        emit_websocket_saturation(ctx);
+    }
+    if outcome.session_capacity_exhausted {
+        emit_middleware_session_capacity_exhausted(ctx);
+    }
+}
+
+pub(super) fn emit_websocket_coverage(
+    ctx: &L7EvalContext,
+    coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
+) {
+    for event in websocket_coverage_events(ctx, coverage) {
+        ocsf_emit!(event);
+    }
+}
+
+/// Build coverage events separately from the tracing pipeline so tests can
+/// assert exact coverage telemetry without process-global callsite cache races.
+pub(super) fn websocket_coverage_events(
+    ctx: &L7EvalContext,
+    coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    coverage
+        .iter()
+        .map(|coverage| {
+            use openshell_supervisor_middleware::WebSocketCoverageState as State;
+
+            let state = match coverage.state {
+                State::BindingNotSelected => "binding_not_selected",
+                State::UnsupportedMessageType => "unsupported_message_type",
+            };
+            let sequence = coverage
+                .sequence
+                .map_or_else(|| "-".to_string(), |sequence| sequence.to_string());
+            let message_type = match coverage.message_type {
+                Some(openshell_supervisor_middleware::WebSocketMessageType::Text) => "text",
+                Some(openshell_supervisor_middleware::WebSocketMessageType::Binary) => "binary",
+                None => "-",
+            };
+            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Other)
+                .activity_name("WebSocket middleware coverage")
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "supervisor-middleware")
+                .unmapped("middleware_config", coverage.config_name.as_str())
+                .unmapped(
+                    "middleware_implementation",
+                    coverage.implementation.as_str(),
+                )
+                .unmapped("coverage_state", state)
+                .unmapped("websocket_message_type", message_type)
+                .unmapped("websocket_sequence", sequence.as_str())
+                .unmapped("input_bytes", coverage.original_size)
+                .message(format!(
+                    "WEBSOCKET_MIDDLEWARE_COVERAGE state={state} config={} implementation={} sequence={sequence} message_type={message_type} input_bytes={}",
+                    coverage.config_name, coverage.implementation, coverage.original_size,
+                ))
+                .build()
+        })
+        .collect()
+}
+
+pub(super) fn emit_websocket_session_start_events(
+    ctx: &L7EvalContext,
+    outcome: &openshell_supervisor_middleware::WebSocketSessionStartOutcome,
+) {
+    emit_websocket_invocations(ctx, &outcome.invocations);
+}
+
+pub(super) fn emit_websocket_message_events(
+    ctx: &L7EvalContext,
+    outcome: &openshell_supervisor_middleware::WebSocketMessageOutcome,
+) {
+    emit_websocket_invocations(ctx, &outcome.invocations);
+    if outcome.saturated {
+        emit_websocket_saturation(ctx);
+    }
+    for event in websocket_message_finding_events(outcome) {
+        ocsf_emit!(event);
+    }
+}
+
+pub(super) fn websocket_preflight_finding_events(
+    outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    middleware_finding_events(&outcome.findings)
+}
+
+pub(super) fn websocket_message_finding_events(
+    outcome: &openshell_supervisor_middleware::WebSocketMessageOutcome,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    middleware_finding_events(&outcome.findings)
+}
+
+pub(super) fn middleware_finding_events(
+    findings: &[openshell_supervisor_middleware::NamespacedFinding],
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    findings
+        .iter()
+        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS)
+        .map(|finding| {
+            DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(match finding.finding.severity.as_str() {
+                    "high" => SeverityId::High,
+                    "low" => SeverityId::Low,
+                    _ => SeverityId::Medium,
+                })
+                .finding_info(FindingInfo::new(
+                    &finding.finding.r#type,
+                    &finding.finding.label,
+                ))
+                .evidence_pairs(&[
+                    ("middleware", &finding.middleware),
+                    ("count", &finding.finding.count.to_string()),
+                ])
+                .unmapped("middleware", finding.middleware.as_str())
+                .unmapped("count", finding.finding.count)
+                .message(format!(
+                    "Middleware finding {} count={}",
+                    finding.finding.r#type, finding.finding.count
+                ))
+                .build()
+        })
+        .collect()
+}
+
+fn emit_websocket_invocations(
+    ctx: &L7EvalContext,
+    invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
+) {
+    for invocation in invocations {
+        use openshell_supervisor_middleware::WebSocketInvocationOutcome as Outcome;
+        let (action, disposition, severity, status, outcome_name) = match invocation.outcome {
+            Outcome::Inspect => (
+                ActionId::Other,
+                DispositionId::Allowed,
+                SeverityId::Informational,
+                StatusId::Success,
+                "inspect",
+            ),
+            Outcome::Skip => (
+                ActionId::Other,
+                DispositionId::Other,
+                SeverityId::Informational,
+                StatusId::Success,
+                "voluntary_skip",
+            ),
+            Outcome::Allow => (
+                ActionId::Allowed,
+                DispositionId::Allowed,
+                SeverityId::Informational,
+                StatusId::Success,
+                "allow",
+            ),
+            Outcome::Deny => (
+                ActionId::Denied,
+                DispositionId::Blocked,
+                SeverityId::Medium,
+                StatusId::Failure,
+                "deny",
+            ),
+            Outcome::FailOpen => (
+                ActionId::Other,
+                DispositionId::Allowed,
+                SeverityId::Medium,
+                StatusId::Failure,
+                "fail_open",
+            ),
+            Outcome::FailClosed => (
+                ActionId::Denied,
+                DispositionId::Blocked,
+                SeverityId::High,
+                StatusId::Failure,
+                "fail_closed",
+            ),
+        };
+        let sequence = invocation
+            .sequence
+            .map_or_else(|| "-".to_string(), |sequence| sequence.to_string());
+        let replacement_size = invocation
+            .replacement_size
+            .map_or_else(|| "-".to_string(), |size| size.to_string());
+        let reason_code = invocation.reason_code.as_deref().unwrap_or("-");
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Other)
+            .activity_name("WebSocket middleware")
+            .action(action)
+            .disposition(disposition)
+            .severity(severity)
+            .status(status)
+            .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+            .firewall_rule(&ctx.policy_name, "supervisor-middleware")
+            .message(format!(
+                "WEBSOCKET_MIDDLEWARE {outcome_name} config={} implementation={} sequence={sequence} input_bytes={} replacement_bytes={replacement_size} transformed={} reason_code={reason_code}",
+                invocation.config_name,
+                invocation.implementation,
+                invocation.original_size,
+                invocation.transformed,
+            ))
+            .build();
+        ocsf_emit!(event);
+        if invocation.failed {
+            let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(if invocation.outcome == Outcome::FailClosed {
+                    SeverityId::High
+                } else {
+                    SeverityId::Medium
+                })
+                .finding_info(FindingInfo::new(
+                    "openshell.middleware.websocket_failure",
+                    "WebSocket middleware processing failure",
+                ))
+                .evidence_pairs(&[
+                    ("policy", ctx.policy_name.as_str()),
+                    ("host", ctx.host.as_str()),
+                    ("config", invocation.config_name.as_str()),
+                    ("implementation", invocation.implementation.as_str()),
+                    ("disposition", outcome_name),
+                ])
+                .message("WebSocket middleware stage failed")
+                .build();
+            ocsf_emit!(event);
+        }
+        if invocation.stage_disabled {
+            let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(SeverityId::Medium)
+                .finding_info(FindingInfo::new(
+                    "openshell.middleware.websocket_stage_disabled",
+                    "WebSocket middleware stage disabled",
+                ))
+                .evidence_pairs(&[
+                    ("policy", ctx.policy_name.as_str()),
+                    ("host", ctx.host.as_str()),
+                    ("config", invocation.config_name.as_str()),
+                    ("implementation", invocation.implementation.as_str()),
+                    ("disposition", outcome_name),
+                ])
+                .message(
+                    "WebSocket middleware stage stream became unusable and was disabled for this session",
+                )
+                .build();
+            ocsf_emit!(event);
+        }
+    }
+}
+
+fn emit_websocket_saturation(ctx: &L7EvalContext) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Medium)
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.admission_saturated",
+            "Supervisor middleware admission saturated",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("operation", "websocket_message"),
+        ])
+        .message("WebSocket middleware work waited for admission capacity")
+        .build();
+    ocsf_emit!(event);
+}
+
+fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Medium)
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.session_capacity_exhausted",
+            "Supervisor middleware session capacity exhausted",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("operation", "websocket_message"),
+        ])
+        .message("Persistent middleware session admission was refused at process capacity")
+        .build();
+    ocsf_emit!(event);
+}
+
+fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Medium)
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.admission_exhausted",
+            "Supervisor middleware admission exhausted",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("operation", "http_request"),
+            ("disposition", "shed"),
+        ])
+        .message("HTTP request shed because middleware work admission was exhausted")
+        .build()
+}
+
+fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
+    ocsf_emit!(middleware_admission_exhausted_event(ctx));
+}
+
 /// Largest body-buffering limit across the entries that actually resolved to a
 /// registered binding. Buffering for the most capable stage lets every stage
 /// that can handle the body run; stages whose own limit is smaller are failed
@@ -98,11 +502,12 @@ pub(super) fn middleware_chain_body_limit(
     chain
         .iter()
         .filter(|entry| entry.is_resolved())
-        .map(openshell_supervisor_middleware::DescribedChainEntry::max_body_bytes)
+        .map(openshell_supervisor_middleware::DescribedChainEntry::max_payload_bytes)
         .max()
 }
 
-pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,
@@ -110,8 +515,9 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
-    apply_middleware_chain_for_scheme(
+    apply_middleware_chain_for_scheme_with_request_id(
         req,
         client,
         ctx,
@@ -120,12 +526,15 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
         runner,
         generation_guard,
         transformed_body_policy,
+        request_id,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin + Send>(
+pub async fn apply_middleware_chain_for_scheme_with_request_id<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,
@@ -134,17 +543,33 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
+    let admission = if chain.is_empty() {
+        None
+    } else {
+        let outcome = runner.reserve_middleware_work().await?;
+        match outcome {
+            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
+                admission,
+            ) => Some(admission),
+            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
+                emit_middleware_admission_exhausted(ctx);
+                return Ok(MiddlewareApplyResult::AdmissionExhausted);
+            }
+        }
+    };
     let Some(max_body_bytes) = middleware_chain_body_limit(&chain) else {
         // No entry resolved to a registered binding, so nothing inspects the
         // body. Apply each entry's `on_error` policy without buffering (an
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
-        let input = middleware_request_input(
+        let input = middleware_request_input_with_id(
+            openshell_ocsf::ctx::ctx(),
             scheme,
             &req,
             ctx,
@@ -152,8 +577,16 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
             Vec::new(),
             String::new(),
             Vec::new(),
+            request_id,
         );
-        let outcome = runner.evaluate_described(&chain, input).await?;
+        let outcome = runner
+            .evaluate_described_with_policy_admitted(
+                &chain,
+                input,
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                admission,
+            )
+            .await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
             MiddlewareApplyResult::Allowed(req)
@@ -163,6 +596,10 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
             }
         });
     };
+    // Admission was reserved above, before reading any request body. Keeping
+    // the guard through evaluation bounds aggregate buffered input across HTTP
+    // requests and WebSocket messages.
+    let admission = admission.expect("resolved middleware chain reserved work admission");
     let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
         &req,
         client,
@@ -178,7 +615,8 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = middleware_request_input(
+    let input = middleware_request_input_with_id(
+        openshell_ocsf::ctx::ctx(),
         scheme,
         &req,
         ctx,
@@ -186,12 +624,18 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         headers.connection_nominated,
         query,
         buffered.body,
+        request_id,
     );
     // The explicitly selected transformation policy either re-checks every
     // replacement or documents that this protocol's policy is body-independent.
     // An ALLOW outcome therefore means the final body is policy-compliant.
     let outcome = runner
-        .evaluate_described_with_policy(&chain, input, transformed_body_policy)
+        .evaluate_described_with_policy_admitted(
+            &chain,
+            input,
+            transformed_body_policy,
+            Some(admission),
+        )
         .await?;
     emit_middleware_events(ctx, &req, &outcome);
     if !outcome.allowed {
@@ -238,7 +682,27 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
     }
 }
 
-pub(super) fn middleware_request_input(
+pub async fn send_middleware_admission_exhausted_response<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    req: &crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+) -> Result<()> {
+    crate::l7::rest::send_middleware_unavailable_response(
+        req,
+        &ctx.policy_name,
+        client,
+        Some(redacted_target),
+        Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn middleware_request_input_with_id(
+    sandbox: &openshell_ocsf::EventContext,
     scheme: &str,
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
@@ -246,10 +710,13 @@ pub(super) fn middleware_request_input(
     connection_nominated_headers: Vec<String>,
     query: String,
     body: Vec<u8>,
+    request_id: &str,
 ) -> openshell_supervisor_middleware::HttpRequestInput {
     openshell_supervisor_middleware::HttpRequestInput {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
+        request_id: request_id.to_string(),
+        sandbox_id: sandbox.sandbox_id.clone(),
+        sandbox_name: sandbox.sandbox_name.clone(),
+        workspace: ctx.workspace.clone(),
         scheme: scheme.into(),
         host: ctx.host.clone(),
         port: ctx.port,
@@ -260,6 +727,32 @@ pub(super) fn middleware_request_input(
         connection_nominated_headers,
         body,
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn middleware_request_input(
+    sandbox: &openshell_ocsf::EventContext,
+    scheme: &str,
+    req: &crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+    headers: Vec<(String, String)>,
+    connection_nominated_headers: Vec<String>,
+    query: String,
+    body: Vec<u8>,
+) -> openshell_supervisor_middleware::HttpRequestInput {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    middleware_request_input_with_id(
+        sandbox,
+        scheme,
+        req,
+        ctx,
+        headers,
+        connection_nominated_headers,
+        query,
+        body,
+        &request_id,
+    )
 }
 
 pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
@@ -499,34 +992,7 @@ pub(super) fn middleware_events(
     // Each stage and the selected chain are independently bounded by the
     // runner. Keep the derived chain-wide emission bound as defense in depth
     // for manually constructed or future outcome producers.
-    for finding in outcome
-        .findings
-        .iter()
-        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS)
-    {
-        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-            .severity(match finding.finding.severity.as_str() {
-                "high" => SeverityId::High,
-                "low" => SeverityId::Low,
-                _ => SeverityId::Medium,
-            })
-            .finding_info(FindingInfo::new(
-                &finding.finding.r#type,
-                &finding.finding.label,
-            ))
-            .evidence_pairs(&[
-                ("middleware", &finding.middleware),
-                ("count", &finding.finding.count.to_string()),
-            ])
-            .unmapped("middleware", finding.middleware.as_str())
-            .unmapped("count", finding.finding.count)
-            .message(format!(
-                "Middleware finding {} count={}",
-                finding.finding.r#type, finding.finding.count
-            ))
-            .build();
-        events.push(event);
-    }
+    events.extend(middleware_finding_events(&outcome.findings));
     events
 }
 
@@ -544,9 +1010,152 @@ fn emit_middleware_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_middleware_headers, send_middleware_rejection_response};
+    use super::{
+        middleware_admission_exhausted_event, safe_middleware_headers,
+        send_middleware_rejection_response, websocket_coverage_events,
+        websocket_message_finding_events, websocket_preflight_finding_events,
+    };
     use crate::l7::relay::L7EvalContext;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn admission_exhaustion_event_contains_only_platform_context() {
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            binary_path: "DO_NOT_LOG_BINARY".into(),
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&middleware_admission_exhausted_event(&ctx))
+            .expect("serialize admission event");
+        assert!(serialized.contains("openshell.middleware.admission_exhausted"));
+        assert!(serialized.contains("api-policy"));
+        assert!(serialized.contains("api.example.test"));
+        assert!(serialized.contains("http_request"));
+        assert!(serialized.contains("shed"));
+        assert!(!serialized.contains("DO_NOT_LOG_BINARY"));
+        assert!(!serialized.contains("middleware_config"));
+        assert!(!serialized.contains("request_body"));
+        assert!(!serialized.contains("query"));
+    }
+
+    #[test]
+    fn websocket_coverage_events_distinguish_selection_from_message_support() {
+        use openshell_ocsf::SeverityId;
+        use openshell_supervisor_middleware::{
+            WebSocketCoverage, WebSocketCoverageState as State, WebSocketMessageType,
+        };
+
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            ..Default::default()
+        };
+        let events = websocket_coverage_events(
+            &ctx,
+            &[
+                WebSocketCoverage {
+                    config_name: "http-guard".into(),
+                    implementation: "example/http-only".into(),
+                    state: State::BindingNotSelected,
+                    sequence: None,
+                    message_type: None,
+                    original_size: 0,
+                },
+                WebSocketCoverage {
+                    config_name: "text-guard".into(),
+                    implementation: "example/websocket-text".into(),
+                    state: State::UnsupportedMessageType,
+                    sequence: Some(7),
+                    message_type: Some(WebSocketMessageType::Binary),
+                    original_size: 23,
+                },
+            ],
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.class_uid() == 4001));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.base().severity == SeverityId::Informational)
+        );
+        let serialized = serde_json::to_string(&events).expect("serialize coverage events");
+        assert!(serialized.contains("binding_not_selected"));
+        assert!(serialized.contains("unsupported_message_type"));
+        assert!(serialized.contains("\"websocket_message_type\":\"binary\""));
+        assert!(serialized.contains("\"websocket_sequence\":\"7\""));
+        assert!(serialized.contains("\"input_bytes\":23"));
+        assert!(!serialized.contains("fail_open"));
+        assert!(!serialized.contains("fail_closed"));
+    }
+
+    #[test]
+    fn websocket_preflight_findings_match_http_mapping() {
+        let outcome = openshell_supervisor_middleware::WebSocketPreflightResult {
+            allowed: true,
+            terminal_reason: None,
+            reason: "allowed".into(),
+            denial: None,
+            session: None,
+            findings: vec![test_namespaced_finding()],
+            metadata: std::collections::BTreeMap::new(),
+            invocations: Vec::new(),
+            coverage: Vec::new(),
+            saturated: false,
+            session_capacity_exhausted: false,
+        };
+
+        assert_middleware_finding_mapping(websocket_preflight_finding_events(&outcome));
+    }
+
+    #[test]
+    fn websocket_message_findings_match_http_mapping() {
+        let outcome = openshell_supervisor_middleware::WebSocketMessageOutcome {
+            allowed: true,
+            reason: "allowed".into(),
+            payload: "hello".into(),
+            findings: vec![test_namespaced_finding()],
+            metadata: std::collections::BTreeMap::new(),
+            invocations: Vec::new(),
+            denial: None,
+            saturated: false,
+            platform_oversize: false,
+        };
+
+        assert_middleware_finding_mapping(websocket_message_finding_events(&outcome));
+    }
+
+    fn test_namespaced_finding() -> openshell_supervisor_middleware::NamespacedFinding {
+        openshell_supervisor_middleware::NamespacedFinding {
+            middleware: "content-guard".into(),
+            finding: openshell_core::proto::Finding {
+                r#type: "regex.api_key".into(),
+                label: "API key".into(),
+                count: 3,
+                confidence: "high".into(),
+                severity: "high".into(),
+            },
+        }
+    }
+
+    fn assert_middleware_finding_mapping(events: Vec<openshell_ocsf::OcsfEvent>) {
+        use openshell_ocsf::SeverityId;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].class_uid(), 2004);
+        assert_eq!(events[0].base().severity, SeverityId::High);
+        let serialized = serde_json::to_string(&events[0]).expect("serialize finding event");
+        assert!(serialized.contains("regex.api_key"));
+        assert!(serialized.contains("API key"));
+        assert!(serialized.contains("content-guard"));
+        assert!(serialized.contains("\"count\":3"));
+        assert!(serialized.contains("Middleware finding regex.api_key count=3"));
+        assert!(!serialized.contains("openshell.middleware.websocket_finding"));
+    }
 
     #[tokio::test]
     async fn direct_denial_uses_middleware_response_without_service_text() {
@@ -592,6 +1201,55 @@ mod tests {
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(!body.to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn middleware_input_carries_real_sandbox_name() {
+        let sandbox = openshell_ocsf::EventContext {
+            sandbox_id: "sbx-123".into(),
+            sandbox_name: "nightly-build".into(),
+            container_image: String::new(),
+            hostname: "h".into(),
+            product_version: "0".into(),
+            proxy_ip: [127, 0, 0, 1].into(),
+            proxy_port: 3128,
+        };
+
+        let eval = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            workspace: "wrks-default".into(),
+            policy_name: "api-policy".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+            secret_resolver: None,
+            ..Default::default()
+        };
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+
+        let input = super::middleware_request_input_with_id(
+            &sandbox,
+            "https",
+            &req,
+            &eval,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+            "exchange-123",
+        );
+
+        assert_eq!(input.sandbox_name, "nightly-build");
+        assert_eq!(input.sandbox_id, "sbx-123");
+        assert_eq!(input.workspace, "wrks-default");
+        assert_eq!(input.request_id, "exchange-123");
     }
 
     #[tokio::test]

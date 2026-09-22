@@ -17,6 +17,52 @@ use openshell_core::proto;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Missing targets are errors unless explicitly allowed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteOptions {
+    pub allow_missing: bool,
+}
+
+/// A deletion acknowledgement is not necessarily completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DeletionOutcome {
+    Unspecified,
+    Completed,
+    Accepted,
+    AlreadyAbsent,
+    Unknown(i32),
+}
+
+impl From<i32> for DeletionOutcome {
+    fn from(value: i32) -> Self {
+        match proto::DeletionOutcome::try_from(value) {
+            Ok(proto::DeletionOutcome::Unspecified) => Self::Unspecified,
+            Ok(proto::DeletionOutcome::Completed) => Self::Completed,
+            Ok(proto::DeletionOutcome::Accepted) => Self::Accepted,
+            Ok(proto::DeletionOutcome::AlreadyAbsent) => Self::AlreadyAbsent,
+            Err(_) => Self::Unknown(value),
+        }
+    }
+}
+
+#[test]
+fn deletion_outcomes_preserve_unknown_values() {
+    assert_eq!(DeletionOutcome::from(0), DeletionOutcome::Unspecified);
+    assert_eq!(DeletionOutcome::from(1), DeletionOutcome::Completed);
+    assert_eq!(DeletionOutcome::from(2), DeletionOutcome::Accepted);
+    assert_eq!(DeletionOutcome::from(3), DeletionOutcome::AlreadyAbsent);
+    assert_eq!(DeletionOutcome::from(99), DeletionOutcome::Unknown(99));
+}
+
+/// Result for the original target, never a same-name replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionResult {
+    pub outcome: DeletionOutcome,
+    /// Present for sandbox deletions that found a target.
+    pub sandbox_id: Option<String>,
+}
+
 /// Gateway health snapshot.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -62,6 +108,10 @@ pub enum SandboxPhase {
     Error,
     Deleting,
     Unknown,
+    Stopping,
+    Stopped,
+    Starting,
+    Completed,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -73,6 +123,10 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Error => Self::Error,
             proto::SandboxPhase::Deleting => Self::Deleting,
             proto::SandboxPhase::Unknown => Self::Unknown,
+            proto::SandboxPhase::Stopping => Self::Stopping,
+            proto::SandboxPhase::Stopped => Self::Stopped,
+            proto::SandboxPhase::Starting => Self::Starting,
+            proto::SandboxPhase::Completed => Self::Completed,
         }
     }
 }
@@ -103,6 +157,75 @@ pub struct SandboxSpec {
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
+    /// Exact canonical command. Empty selects the gateway's scratch login shell.
+    pub command: Vec<String>,
+    /// Allocate a retained pseudo-terminal for the canonical command.
+    pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
+}
+
+/// A loopback HTTP service to expose during sandbox creation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceExposure {
+    /// Service name. Empty selects the sandbox's unnamed endpoint.
+    pub service: String,
+    /// Loopback TCP port inside the sandbox.
+    pub target_port: u16,
+}
+
+/// Caller intent for creating a sandbox from a named workload template.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateCreateSpec {
+    /// Optional user-supplied sandbox name. When empty the server generates one.
+    pub name: Option<String>,
+    /// Workspace-scoped template name to resolve at creation time.
+    pub template_name: String,
+    /// Labels attached to the sandbox.
+    pub labels: HashMap<String, String>,
+    /// Provider names to attach.
+    pub providers: Vec<String>,
+    /// Exact canonical command. Empty selects the gateway's scratch login shell.
+    pub command: Vec<String>,
+    /// Allocate a retained pseudo-terminal for the canonical command.
+    pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
+    /// Create-time sandbox policy. The named workload template supplies runtime
+    /// workload fields; policy remains part of the sandbox's governance spec.
+    pub policy: Option<proto::SandboxPolicy>,
+}
+
+/// Reusable sandbox workload template resource.
+///
+/// This is a raw proto alias because template specs intentionally expose the
+/// full portable workload shape plus driver-owned config.
+pub type SandboxWorkloadTemplate = proto::SandboxWorkloadTemplate;
+
+/// Desired reusable workload shape for a [`SandboxWorkloadTemplate`].
+pub type SandboxWorkloadTemplateSpec = proto::SandboxWorkloadTemplateSpec;
+
+/// Portable sandbox workload configuration for template-backed sandboxes.
+pub type SandboxWorkloadConfig = proto::SandboxWorkloadConfig;
+
+/// Portable resource requirements for template-backed sandboxes.
+pub type SandboxResources = proto::SandboxResources;
+
+/// Desired service level for sandboxes created from a template.
+pub type SandboxServiceLevel = proto::SandboxServiceLevel;
+
+/// Startup service-level settings for template-backed sandboxes.
+pub type SandboxStartup = proto::SandboxStartup;
+
+/// Options for listing reusable sandbox templates.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateListOptions {
+    /// Maximum templates requested per page. `0` uses the server default.
+    pub page_size: i32,
+    /// Opaque token from a previous page. Empty starts at the beginning.
+    pub page_token: String,
+    /// Optional label selector in `key=value,key2=value2` form.
+    pub label_selector: String,
 }
 
 /// Reference to a sandbox owned by the gateway.
@@ -115,11 +238,32 @@ pub struct SandboxRef {
     pub phase: SandboxPhase,
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
+    pub exit_code: Option<i32>,
+    pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
+    /// Service URLs returned by sandbox creation, keyed by service name. The
+    /// empty key identifies the unnamed service. Non-create reads leave this empty.
+    pub service_urls: HashMap<String, String>,
+}
+
+/// Reusable workload template revision used to create a sandbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SandboxWorkloadTemplateProvenance {
+    pub name: String,
+    pub resource_version: String,
 }
 
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
+        let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
+        let created_from_workload_template =
+            sandbox
+                .created_from_workload_template
+                .map(|p| SandboxWorkloadTemplateProvenance {
+                    name: p.name,
+                    resource_version: p.resource_version,
+                });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -128,6 +272,9 @@ impl SandboxRef {
             phase,
             labels: meta.labels,
             resource_version: meta.resource_version,
+            exit_code,
+            created_from_workload_template,
+            service_urls: HashMap::new(),
         }
     }
 }
@@ -163,10 +310,10 @@ impl WorkspaceRef {
 /// Options for listing sandboxes.
 #[derive(Clone, Debug, Default)]
 pub struct ListOptions {
-    /// Maximum sandboxes to return. `0` defers to the server default.
-    pub limit: u32,
-    /// Offset into the result list.
-    pub offset: u32,
+    /// Maximum resources requested per page. `0` uses the server default.
+    pub page_size: i32,
+    /// Opaque token from a previous page. Empty starts at the beginning.
+    pub page_token: String,
     /// Optional Kubernetes-style label selector (e.g. `env=prod,team=core`).
     pub label_selector: Option<String>,
 }
@@ -182,6 +329,9 @@ pub struct ExecOptions {
     pub timeout: Option<Duration>,
     /// Optional stdin payload.
     pub stdin: Option<Vec<u8>>,
+    /// Skip sourcing shell login/profile startup files before the command.
+    /// Default (`false`) preserves login-shell behavior.
+    pub no_login_shell: bool,
 }
 
 /// Result of a non-streaming exec call.

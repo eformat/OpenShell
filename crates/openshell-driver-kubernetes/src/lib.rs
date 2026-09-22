@@ -5,12 +5,16 @@ pub mod activation_client;
 pub mod config;
 pub mod driver;
 pub mod grpc;
+pub mod isolation;
+pub mod otel_tracing;
+mod sandbox_runtime;
 pub mod warm_pool;
 
 pub use config::{
-    AppArmorProfile, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, KubernetesSidecarConfig,
-    SupervisorSideloadMethod, SupervisorTopology,
+    DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
+    KubernetesComputeConfig, KubernetesImagePullPolicy, KubernetesSandboxRuntimeConfig,
+    ManagedSshIngressConfig, WorkspaceMode, managed_namespace_prefix,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;
+pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;

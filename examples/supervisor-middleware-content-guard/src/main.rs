@@ -6,23 +6,37 @@ use std::net::SocketAddr;
 use std::ops::Range;
 
 use clap::Parser;
+use openshell_core::middleware::{HttpResponseResultStream, WebSocketResponseStream};
+use openshell_core::proto::middleware::v1::http_response_pre_return_server::{
+    HttpResponsePreReturn, HttpResponsePreReturnServer,
+};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
 use openshell_core::proto::{
-    Decision, Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
-    MiddlewareManifest, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
-    ValidateConfigRequest, ValidateConfigResponse,
+    Decision, Finding, HttpRequestEvaluation, HttpRequestResult, HttpResponseBlockDelivery,
+    HttpResponseBodyMode, HttpResponseBodyResult, HttpResponseBodyTransform, HttpResponseEvent,
+    HttpResponseEventResult, HttpResponsePreflightInspect, HttpResponsePreflightResult,
+    HttpResponseTrailersResult, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketMessage, WebSocketMessageResult, WebSocketPreflightAction,
+    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
+    http_response_body_result, http_response_body_transform, http_response_body_unit,
+    http_response_event, http_response_event_result, http_response_preflight_result,
+    web_socket_message, web_socket_message_result, web_socket_session_event,
+    web_socket_session_event_result,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 const MANIFEST_NAME: &str = "example/content-guard-service";
-const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;
 const PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
-const MAX_BODY_BYTES: u64 = 256 * 1024;
+const MAX_PAYLOAD_BYTES: u64 = 256 * 1024;
 const DEFAULT_REPLACEMENT: &str = "[REDACTED]";
 
 #[derive(Debug, Parser)]
@@ -113,22 +127,150 @@ fn optional_string_field<'a>(config: &'a Struct, name: &str) -> Result<Option<&'
 #[derive(Debug, Default)]
 struct ContentGuard;
 
+impl ContentGuard {
+    fn websocket_stream<S>(mut events: S) -> WebSocketResponseStream
+    where
+        S: Stream<Item = Result<WebSocketSessionEvent, Status>> + Send + Unpin + 'static,
+    {
+        let (results_tx, results_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut config = None;
+            let mut started = false;
+            let mut sequence_lower_bound = Some(1_u64);
+
+            while let Some(event) = events.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let _ = results_tx.send(Err(error)).await;
+                        break;
+                    }
+                };
+                let result = match event.event {
+                    Some(web_socket_session_event::Event::Preflight(preflight))
+                        if config.is_none() && !started =>
+                    {
+                        if let Err(error) = validate_phase(preflight.phase) {
+                            Err(Status::invalid_argument(error))
+                        } else {
+                            match GuardConfig::parse(preflight.config.as_ref()) {
+                                Ok(selected_config) => {
+                                    config = Some(selected_config);
+                                    Ok(Some(WebSocketSessionEventResult {
+                                        result: Some(
+                                            web_socket_session_event_result::Result::PreflightDecision(
+                                                WebSocketPreflightDecision {
+                                                    action: WebSocketPreflightAction::Inspect
+                                                        as i32,
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ),
+                                    }))
+                                }
+                                Err(error) => Err(Status::invalid_argument(error)),
+                            }
+                        }
+                    }
+                    Some(web_socket_session_event::Event::SessionStart(_))
+                        if config.is_some() && !started =>
+                    {
+                        started = true;
+                        Ok(None)
+                    }
+                    Some(web_socket_session_event::Event::Message(message)) if started => {
+                        if let Err(error) = advance_sequence_lower_bound(
+                            &mut sequence_lower_bound,
+                            message.sequence,
+                        ) {
+                            Err(error)
+                        } else {
+                            let selected_config =
+                                config.as_ref().expect("started stream has config");
+                            evaluate_websocket_message(selected_config, &message).map(|result| {
+                                Some(WebSocketSessionEventResult {
+                                    result: Some(
+                                        web_socket_session_event_result::Result::MessageResult(
+                                            result,
+                                        ),
+                                    ),
+                                })
+                            })
+                        }
+                    }
+                    Some(web_socket_session_event::Event::SessionEnd(_)) if config.is_some() => {
+                        break;
+                    }
+                    _ => Err(Status::failed_precondition(
+                        "invalid content guard WebSocket session lifecycle",
+                    )),
+                };
+
+                match result {
+                    Ok(Some(result)) => {
+                        if results_tx.send(Ok(result)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = results_tx.send(Err(error)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(results_rx))
+    }
+}
+
 #[tonic::async_trait]
 impl SupervisorMiddleware for ContentGuard {
+    type EvaluateWebSocketSessionStream = WebSocketResponseStream;
+
     async fn describe(
         &self,
-        _request: Request<()>,
+        request: Request<MiddlewareDescribeRequest>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
-        Ok(Response::new(MiddlewareManifest {
+        let manifest = MiddlewareManifest {
             name: MANIFEST_NAME.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
-            bindings: vec![MiddlewareBinding {
-                operation: OPERATION as i32,
-                phase: PHASE as i32,
-                max_body_bytes: MAX_BODY_BYTES,
-                timeout: String::new(),
-            }],
-        }))
+            bindings: vec![
+                MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: PHASE as i32,
+                    max_payload_bytes: MAX_PAYLOAD_BYTES,
+                    request_timeout: None,
+                },
+                MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
+                    phase: PHASE as i32,
+                    max_payload_bytes: MAX_PAYLOAD_BYTES,
+                    request_timeout: None,
+                },
+                MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: MAX_PAYLOAD_BYTES,
+                    request_timeout: None,
+                },
+            ],
+            expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                MANIFEST_NAME,
+                openshell_core::VERSION,
+                [],
+            )),
+        };
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+            MANIFEST_NAME,
+            manifest.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(manifest))
     }
 
     async fn validate_config(
@@ -161,6 +303,153 @@ impl SupervisorMiddleware for ContentGuard {
             .map_err(|_| Status::invalid_argument("content guard requires a UTF-8 body"))?;
         Ok(Response::new(evaluate(&config, &body)))
     }
+
+    async fn evaluate_web_socket_session(
+        &self,
+        request: Request<tonic::Streaming<WebSocketSessionEvent>>,
+    ) -> Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
+        Ok(Response::new(Self::websocket_stream(request.into_inner())))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResponseSessionState {
+    config: Option<GuardConfig>,
+    body_ended: bool,
+    trailers_seen: bool,
+}
+impl ResponseSessionState {
+    fn preflight(
+        &mut self,
+        preflight: openshell_core::proto::HttpResponsePreflight,
+    ) -> Result<HttpResponseEventResult, Status> {
+        if self.config.is_some() {
+            return Err(Status::failed_precondition("duplicate preflight"));
+        }
+        let config =
+            GuardConfig::parse(preflight.config.as_ref()).map_err(Status::invalid_argument)?;
+        if !preflight
+            .permitted_body_modes
+            .contains(&(HttpResponseBodyMode::WholeBodyBytes as i32))
+        {
+            return Err(Status::failed_precondition(
+                "content guard requires WHOLE_BODY_BYTES",
+            ));
+        }
+        self.config = Some(config);
+        Ok(HttpResponseEventResult {
+            result: Some(http_response_event_result::Result::PreflightResult(
+                HttpResponsePreflightResult {
+                    action: Some(http_response_preflight_result::Action::Inspect(
+                        HttpResponsePreflightInspect {
+                            body_mode: HttpResponseBodyMode::WholeBodyBytes as i32,
+                            header_mutations: vec![],
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        })
+    }
+    fn body(
+        &mut self,
+        body: openshell_core::proto::HttpResponseBodyUnit,
+    ) -> Result<HttpResponseEventResult, Status> {
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("body before preflight"))?;
+        if self.body_ended || body.sequence != 1 || !body.end_of_stream {
+            return Err(Status::failed_precondition(
+                "expected one complete response body",
+            ));
+        }
+        let Some(http_response_body_unit::Payload::Data(data)) = body.payload else {
+            return Err(Status::invalid_argument("body data required"));
+        };
+        let text = std::str::from_utf8(&data)
+            .map_err(|_| Status::invalid_argument("content guard requires a UTF-8 body"))?;
+        let result = inspect(config, text);
+        let action = if result.denied {
+            http_response_body_result::Action::BlockDelivery(HttpResponseBlockDelivery {})
+        } else if let Some(replacement) = result.replacement {
+            http_response_body_result::Action::Transform(HttpResponseBodyTransform {
+                replacement: Some(http_response_body_transform::Replacement::Data(
+                    replacement.into_bytes(),
+                )),
+            })
+        } else {
+            http_response_body_result::Action::PassThrough(
+                openshell_core::proto::HttpResponseBodyPassThrough {},
+            )
+        };
+        self.body_ended = true;
+        Ok(HttpResponseEventResult {
+            result: Some(http_response_event_result::Result::BodyResult(
+                HttpResponseBodyResult {
+                    sequence: body.sequence,
+                    action: Some(action),
+                    reason: result.reason,
+                    reason_code: result.reason_code,
+                    findings: result.findings,
+                    metadata: result.metadata,
+                },
+            )),
+        })
+    }
+    fn trailers(&mut self) -> Result<HttpResponseEventResult, Status> {
+        if !self.body_ended || self.trailers_seen {
+            return Err(Status::failed_precondition("expected trailers after body"));
+        }
+        self.trailers_seen = true;
+        Ok(HttpResponseEventResult {
+            result: Some(http_response_event_result::Result::TrailersResult(
+                HttpResponseTrailersResult::default(),
+            )),
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl HttpResponsePreReturn for ContentGuard {
+    type EvaluateStream = HttpResponseResultStream;
+
+    async fn evaluate(
+        &self,
+        request: Request<tonic::Streaming<HttpResponseEvent>>,
+    ) -> Result<Response<Self::EvaluateStream>, Status> {
+        let mut events = request.into_inner();
+        let (sender, receiver) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut state = ResponseSessionState::default();
+            while let Some(event) = events.next().await {
+                let result = match event {
+                    Ok(event) => match event.event {
+                        Some(http_response_event::Event::Preflight(preflight)) => {
+                            state.preflight(preflight)
+                        }
+                        Some(http_response_event::Event::Body(body)) => state.body(body),
+                        Some(http_response_event::Event::Trailers(_)) => state.trailers(),
+                        Some(http_response_event::Event::SessionEnd(_)) => break,
+                        None => Err(Status::invalid_argument("response event is required")),
+                    },
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(result) => {
+                        if sender.send(Ok(result)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
 }
 
 fn validate_phase(phase: i32) -> Result<(), String> {
@@ -170,11 +459,37 @@ fn validate_phase(phase: i32) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Default)]
+struct GuardOutcome {
+    denied: bool,
+    replacement: Option<String>,
+    reason: String,
+    reason_code: String,
+    findings: Vec<Finding>,
+    metadata: HashMap<String, String>,
+}
 fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
+    let result = inspect(config, body);
+    HttpRequestResult {
+        decision: if result.denied {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        } as i32,
+        has_body: result.replacement.is_some(),
+        body: result.replacement.unwrap_or_default().into_bytes(),
+        reason: result.reason,
+        reason_code: result.reason_code,
+        findings: result.findings,
+        metadata: result.metadata,
+        ..Default::default()
+    }
+}
+fn inspect(config: &GuardConfig, body: &str) -> GuardOutcome {
     let (ranges, match_count, matched_term_count) = find_match_ranges(body, &config.terms);
 
     if match_count == 0 {
-        return allow_result();
+        return GuardOutcome::default();
     }
 
     let finding = Finding {
@@ -196,28 +511,76 @@ fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
         ),
     ]);
 
-    match config.mode {
-        Mode::Redact => HttpRequestResult {
-            decision: Decision::Allow as i32,
-            reason: String::new(),
-            body: redact_ranges(body, &ranges, &config.replacement).into_bytes(),
-            has_body: true,
-            header_mutations: Vec::new(),
-            findings: vec![finding],
-            metadata,
-            reason_code: String::new(),
+    GuardOutcome {
+        denied: config.mode == Mode::Deny,
+        replacement: (config.mode == Mode::Redact)
+            .then(|| redact_ranges(body, &ranges, &config.replacement)),
+        reason: if config.mode == Mode::Deny {
+            "payload matched configured content".into()
+        } else {
+            String::new()
         },
-        Mode::Deny => HttpRequestResult {
-            decision: Decision::Deny as i32,
-            reason: "request body matched configured content".into(),
-            body: Vec::new(),
-            has_body: false,
-            header_mutations: Vec::new(),
-            findings: vec![finding],
-            metadata,
-            reason_code: "content_match".into(),
+        reason_code: if config.mode == Mode::Deny {
+            "content_match".into()
+        } else {
+            String::new()
         },
+        findings: vec![finding],
+        metadata,
     }
+}
+
+fn evaluate_websocket_message(
+    config: &GuardConfig,
+    message: &WebSocketMessage,
+) -> Result<WebSocketMessageResult, Status> {
+    let Some(web_socket_message::Payload::Text(payload)) = message.payload.as_ref() else {
+        return Err(Status::invalid_argument(
+            "content guard supports only WebSocket text messages",
+        ));
+    };
+    let payload_bytes = u64::try_from(payload.len()).map_err(|_| {
+        Status::invalid_argument("WebSocket text message length is not representable")
+    })?;
+    if payload_bytes > MAX_PAYLOAD_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "WebSocket text message exceeds {MAX_PAYLOAD_BYTES} bytes"
+        )));
+    }
+    let result = inspect(config, payload);
+    Ok(WebSocketMessageResult {
+        sequence: message.sequence,
+        decision: if result.denied {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        } as i32,
+        replacement: result
+            .replacement
+            .map(web_socket_message_result::Replacement::Text),
+        reason: result.reason,
+        reason_code: result.reason_code,
+        findings: result.findings,
+        metadata: result.metadata,
+    })
+}
+
+fn advance_sequence_lower_bound(
+    lower_bound: &mut Option<u64>,
+    sequence: u64,
+) -> Result<(), Status> {
+    let Some(current_lower_bound) = *lower_bound else {
+        return Err(Status::invalid_argument(
+            "WebSocket message sequence must be strictly increasing",
+        ));
+    };
+    if sequence < current_lower_bound {
+        return Err(Status::invalid_argument(
+            "WebSocket message sequence must be strictly increasing",
+        ));
+    }
+    *lower_bound = sequence.checked_add(1);
+    Ok(())
 }
 
 fn find_match_ranges(body: &str, terms: &[String]) -> (Vec<Range<usize>>, u32, u32) {
@@ -277,25 +640,13 @@ fn redact_ranges(body: &str, ranges: &[Range<usize>], replacement: &str) -> Stri
     transformed
 }
 
-fn allow_result() -> HttpRequestResult {
-    HttpRequestResult {
-        decision: Decision::Allow as i32,
-        reason: String::new(),
-        body: Vec::new(),
-        has_body: false,
-        header_mutations: Vec::new(),
-        findings: Vec::new(),
-        metadata: HashMap::new(),
-        reason_code: String::new(),
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     println!("serving {MANIFEST_NAME} on http://{}", cli.bind);
     Server::builder()
         .add_service(SupervisorMiddlewareServer::new(ContentGuard))
+        .add_service(HttpResponsePreReturnServer::new(ContentGuard))
         .serve(cli.bind)
         .await?;
     Ok(())
@@ -304,6 +655,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::{
+        HttpResponseBodyUnit, HttpResponsePreflight, MiddlewareSessionEnd, WebSocketPreflight,
+        WebSocketSessionStart,
+    };
     use prost_types::{ListValue, Value};
     use std::collections::BTreeMap;
 
@@ -329,6 +684,237 @@ mod tests {
             fields.insert("replacement".into(), string(replacement));
         }
         Struct { fields }
+    }
+
+    fn event(event: web_socket_session_event::Event) -> Result<WebSocketSessionEvent, Status> {
+        Ok(WebSocketSessionEvent { event: Some(event) })
+    }
+
+    #[tokio::test]
+    async fn manifest_advertises_request_response_and_websocket_bindings() {
+        let manifest = SupervisorMiddleware::describe(
+            &ContentGuard,
+            Request::new(MiddlewareDescribeRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                )),
+            }),
+        )
+        .await
+        .expect("describe")
+        .into_inner();
+
+        assert_eq!(manifest.bindings.len(), 3);
+        assert_eq!(
+            manifest.bindings[0].operation,
+            SupervisorMiddlewareOperation::HttpRequest as i32
+        );
+        assert_eq!(manifest.bindings[0].max_payload_bytes, MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            manifest.bindings[1].operation,
+            SupervisorMiddlewareOperation::WebsocketMessage as i32
+        );
+        assert_eq!(manifest.bindings[1].max_payload_bytes, MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            manifest.bindings[2].operation,
+            SupervisorMiddlewareOperation::HttpResponse as i32
+        );
+        assert_eq!(
+            manifest.bindings[2].phase,
+            SupervisorMiddlewarePhase::PreReturn as i32
+        );
+    }
+
+    fn response_preflight(mode: &str) -> HttpResponsePreflight {
+        HttpResponsePreflight {
+            config: Some(config(mode, &["prototype-secret", "秘密"], None)),
+            permitted_body_modes: vec![HttpResponseBodyMode::WholeBodyBytes as i32],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn response_guard_passes_redacts_and_denies() {
+        for (mode, input, expected) in [
+            ("redact", "clean", None),
+            (
+                "redact",
+                "a prototype-secret 秘密",
+                Some("a [REDACTED] [REDACTED]"),
+            ),
+            ("deny", "prototype-secret", None),
+        ] {
+            let mut state = ResponseSessionState::default();
+            state.preflight(response_preflight(mode)).unwrap();
+            let unit = HttpResponseBodyUnit {
+                sequence: 1,
+                payload: Some(http_response_body_unit::Payload::Data(
+                    input.as_bytes().to_vec(),
+                )),
+                end_of_stream: true,
+            };
+            let result = state.body(unit.clone()).unwrap();
+            assert!(state.body(unit).is_err());
+            let Some(http_response_event_result::Result::BodyResult(result)) = result.result else {
+                panic!("body result")
+            };
+            if mode == "deny" {
+                assert!(matches!(
+                    result.action,
+                    Some(http_response_body_result::Action::BlockDelivery(_))
+                ));
+                assert_eq!(result.reason_code, "content_match");
+            } else if let Some(expected) = expected {
+                let Some(http_response_body_result::Action::Transform(transform)) = result.action
+                else {
+                    panic!("transform")
+                };
+                assert_eq!(
+                    transform.replacement,
+                    Some(http_response_body_transform::Replacement::Data(
+                        expected.as_bytes().to_vec()
+                    ))
+                );
+            } else {
+                assert!(matches!(
+                    result.action,
+                    Some(http_response_body_result::Action::PassThrough(_))
+                ));
+            }
+            let trailers = state.trailers().unwrap();
+            let Some(http_response_event_result::Result::TrailersResult(trailers)) =
+                trailers.result
+            else {
+                panic!("trailers")
+            };
+            assert!(trailers.trailer_mutations.is_empty());
+            assert!(state.trailers().is_err());
+        }
+    }
+    #[test]
+    fn response_guard_rejects_unavailable_inspection_and_invalid_input() {
+        let mut preflight = response_preflight("redact");
+        preflight.permitted_body_modes = vec![HttpResponseBodyMode::HeadersOnly as i32];
+        assert!(
+            ResponseSessionState::default()
+                .preflight(preflight)
+                .is_err()
+        );
+        for (sequence, end_of_stream, payload) in [
+            (2, true, Some(vec![])),
+            (1, false, Some(vec![])),
+            (1, true, Some(vec![0xff])),
+            (1, true, None),
+        ] {
+            let mut state = ResponseSessionState::default();
+            assert!(state.trailers().is_err());
+            state.preflight(response_preflight("redact")).unwrap();
+            assert!(state.preflight(response_preflight("redact")).is_err());
+            assert!(
+                state
+                    .body(HttpResponseBodyUnit {
+                        sequence,
+                        end_of_stream,
+                        payload: payload.map(http_response_body_unit::Payload::Data)
+                    })
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_rejects_missing_gateway_metadata() {
+        let error = SupervisorMiddleware::describe(
+            &ContentGuard,
+            Request::new(MiddlewareDescribeRequest::default()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("gateway did not provide protocol metadata")
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_redacts_text_messages() {
+        let events = tokio_stream::iter([
+            event(web_socket_session_event::Event::Preflight(
+                WebSocketPreflight {
+                    phase: PHASE as i32,
+                    config: Some(config("redact", &["prototype-secret"], Some("[FILTERED]"))),
+                    ..Default::default()
+                },
+            )),
+            event(web_socket_session_event::Event::SessionStart(
+                WebSocketSessionStart::default(),
+            )),
+            event(web_socket_session_event::Event::Message(WebSocketMessage {
+                sequence: 1,
+                payload: Some(web_socket_message::Payload::Text(
+                    "contains prototype-secret".into(),
+                )),
+            })),
+            event(web_socket_session_event::Event::SessionEnd(
+                MiddlewareSessionEnd::default(),
+            )),
+        ]);
+        let mut results = ContentGuard::websocket_stream(events);
+
+        let preflight = results
+            .next()
+            .await
+            .expect("preflight result")
+            .expect("valid preflight result");
+        assert!(matches!(
+            preflight.result,
+            Some(web_socket_session_event_result::Result::PreflightDecision(
+                WebSocketPreflightDecision { action, .. }
+            )) if action == WebSocketPreflightAction::Inspect as i32
+        ));
+
+        let message = results
+            .next()
+            .await
+            .expect("message result")
+            .expect("valid message result");
+        let Some(web_socket_session_event_result::Result::MessageResult(message)) = message.result
+        else {
+            panic!("expected message result");
+        };
+        assert_eq!(message.decision, Decision::Allow as i32);
+        assert_eq!(
+            message.replacement,
+            Some(web_socket_message_result::Replacement::Text(
+                "contains [FILTERED]".into()
+            ))
+        );
+        assert_eq!(message.findings[0].count, 1);
+        assert!(results.next().await.is_none());
+    }
+
+    #[test]
+    fn websocket_deny_preserves_safe_diagnostics() {
+        let config = GuardConfig::parse(Some(&config("deny", &["prototype-secret"], None)))
+            .expect("valid config");
+        let result = evaluate_websocket_message(
+            &config,
+            &WebSocketMessage {
+                sequence: 7,
+                payload: Some(web_socket_message::Payload::Text(
+                    "contains prototype-secret".into(),
+                )),
+            },
+        )
+        .expect("message result");
+
+        assert_eq!(result.sequence, 7);
+        assert_eq!(result.decision, Decision::Deny as i32);
+        assert_eq!(result.reason_code, "content_match");
+        assert!(!result.reason.contains("prototype-secret"));
+        assert!(result.replacement.is_none());
     }
 
     #[test]
@@ -458,5 +1044,12 @@ mod tests {
 
         assert_eq!(parsed.mode, Mode::Redact);
         assert_eq!(parsed.replacement, DEFAULT_REPLACEMENT);
+    }
+
+    #[test]
+    fn example_policy_is_valid() {
+        let policy = openshell_policy::parse_sandbox_policy(include_str!("../policy.yaml"))
+            .expect("example policy must parse");
+        openshell_policy::validate_sandbox_policy(&policy).expect("example policy must be valid");
     }
 }
